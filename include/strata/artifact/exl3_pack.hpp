@@ -34,7 +34,7 @@ public:
 
     /// Populate `wt` (engine names).  Uploads EXL3 linears and stages the rest into a device arena this owns.
     /// `stream` may be null.  `layer_lo/hi` restrict the layer range for a split (default: all).
-    bool build(WeightTable& wt, std::string& err, void* stream = nullptr);
+    bool build(WeightTable& wt, std::string& err, void* stream = nullptr, int layer_lo = 0, int layer_hi = 48);
 
     /// Device bytes for the EXL3 linears + the staged arena (for the engine's budget/report).
     uint64_t exl3_bytes() const { return exl3_bytes_; }

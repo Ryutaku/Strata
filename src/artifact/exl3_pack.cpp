@@ -163,13 +163,20 @@ struct Exl3Pack::Impl {
     std::map<std::string, std::string> weight_map;
     std::map<std::string, std::unique_ptr<SafetensorsFile>> shards;
     std::vector<void*> dev_allocs;   // Exl3Mat uploads + arena
+    int device = -1;
 
     explicit Impl(const std::string& d) : dir(d), model(d) {
+        if (cudaGetDevice(&device) != cudaSuccess) throw std::runtime_error("exl3: no CUDA device");
         std::ifstream in(d + "/model.safetensors.index.json", std::ios::binary);
         std::ostringstream ss; ss << in.rdbuf();
         weight_map = exl3_detail::parse_weight_map(ss.str());
     }
-    ~Impl() { for (void* p : dev_allocs) (void) cudaFree(p); }
+    ~Impl() {
+        int previous = -1;
+        (void) cudaGetDevice(&previous); (void) cudaSetDevice(device);
+        for (void* p : dev_allocs) (void) cudaFree(p);
+        if (previous >= 0) (void) cudaSetDevice(previous);
+    }
 
     const SafetensorsFile& shard(const std::string& name) {
         auto it = shards.find(name);
@@ -559,10 +566,15 @@ bool stage_exl3_requantized(Exl3Pack::Impl& im, const RoleSpec& r, const ModelGe
     return true;
 }
 
-bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
+bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream, int layer_lo, int layer_hi) {
     (void) stream;
     Impl& im = *impl_;
     try {
+        int device = -1;
+        if (layer_lo < 0 || layer_lo >= layer_hi || layer_hi > 48 || !im.dev_allocs.empty() ||
+            cudaGetDevice(&device) != cudaSuccess || device != im.device) {
+            err = "exl3: invalid layer range, repeated build or device mismatch"; return false;
+        }
         const ModelGeometry g;
         // ---- size the non-EXL3 arena by walking the roles once (all staged tensors), then upload.
         struct Staged { const RoleSpec* r; std::string hf, engine; };
@@ -572,7 +584,7 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
         };
         for (const RoleSpec& r : kGlobal)
             if (!r.exl3) add(r, r.hf, r.engine);
-        for (int layer = 0; layer < 48; ++layer) {
+        for (int layer = layer_lo; layer < layer_hi; ++layer) {
             const bool qsa = (layer % 4) == 3;
             auto for_each = [&](const RoleSpec* arr, size_t n) {
                 for (size_t i = 0; i < n; ++i) {
@@ -641,7 +653,7 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
             int64_t max_in = 0;
             for (const RoleSpec& r : kGlobal)
                 if (r.exl3) { try { max_in = std::max(max_in, (int64_t) im.model.linear(r.hf).in()); } catch (...) {} }
-            for (int layer = 0; layer < 48; ++layer) {
+            for (int layer = layer_lo; layer < layer_hi; ++layer) {
                 const bool qsa = (layer % 4) == 3;
                 auto scan = [&](const RoleSpec* arr, size_t n) {
                     for (size_t i = 0; i < n; ++i) {
@@ -661,7 +673,7 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
         for (const RoleSpec& r : kGlobal)
             if (r.exl3 && !(use_q5(r) ? stage_exl3_requantized(im, r, g, r.hf, r.engine, wt, err, exl3_bytes_, q8_scratch)
                                       : stage_exl3(im, r, g, r.hf, r.engine, wt, err, exl3_bytes_))) return false;
-        for (int layer = 0; layer < 48; ++layer) {
+        for (int layer = layer_lo; layer < layer_hi; ++layer) {
             const bool qsa = (layer % 4) == 3;
             auto for_each = [&](const RoleSpec* arr, size_t n) -> bool {
                 for (size_t i = 0; i < n; ++i) {
@@ -684,7 +696,10 @@ bool Exl3Pack::build(WeightTable& wt, std::string& err, void* stream) {
         }
 
         // ---- validate against the engine's own shape contract
-        if (!check_all(wt, g, err)) return false;
+        if (layer_lo == 0 && layer_hi == 48) {
+            if (!check_all(wt, g, err)) return false;
+        } else for (int layer = layer_lo; layer < layer_hi; ++layer)
+            if (!check_layer(wt, g, layer, err)) return false;
         LoadReport rep;
         rep.tensors = wt.all().size();
         rep.arena_bytes = arena_bytes_ + exl3_bytes_;

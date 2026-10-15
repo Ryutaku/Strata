@@ -53,13 +53,22 @@ public:
     /// already uses (`--resident-cpu-experts`): a miss is read into RAM, and every later miss of the same
     /// expert is a memcpy at RAM speed (0.2 ms per 1.86 MB against 3.7 ms from the disk).
     Exl3ExpertStream(const std::string& model_dir, int n_embd, int n_layers, int slots_per_layer, void* stream,
-                     size_t ram_cache_bytes = 0);
+                     size_t ram_cache_bytes = 0, size_t reserve_device_bytes = (size_t) 512 << 20,
+                     int layer_lo = 0, int layer_hi = -1, int prefill_tokens = 0);
     ~Exl3ExpertStream();
     Exl3ExpertStream(const Exl3ExpertStream&) = delete;
     Exl3ExpertStream& operator=(const Exl3ExpertStream&) = delete;
 
     // out[i*n_embd] = ffn(layer, expert ids[i], x) for i in [0,k).  `x_f32` and `out` are HOST fp32.
     bool run(int layer, const float* x_f32, const int* ids, int k, float* out, void* stream);
+    // HOST x_f32[tokens, n_embd], ids[tokens, k], out[tokens*k, n_embd]. Groups routes by
+    // expert, stages each distinct expert once per window, and restores token-major output order.
+    // Scratch is bounded by the input and a 4096-route tile, not tokens*k*n_embd device output.
+    bool run_multi(int layer, const float* x_f32, const int32_t* ids, int tokens, int k,
+                    float* out, void* stream);
+    // Prefill: x_f32 and out are DEVICE, ids is HOST. Large expert groups use tensor-core GEMM.
+    bool run_device(int layer, const float* x_f32, const int32_t* ids, int tokens, int k,
+                     float* out, void* stream);
     size_t bytes() const;
     int slots_per_layer() const;
     /// the host cache's slots per layer and its bytes (0 when it is off)
@@ -67,6 +76,8 @@ public:
     size_t ram_bytes() const;
 
 private:
+    bool run_multi_impl(int layer, const float* x_f32, const int32_t* ids, int tokens, int k,
+                         float* out, void* stream, bool device_io);
     struct Impl;
     Impl* impl_ = nullptr;
 };

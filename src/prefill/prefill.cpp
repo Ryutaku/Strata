@@ -36,6 +36,7 @@
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_fused.hpp"
+#include "strata/kernels/exl3_experts.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -1419,8 +1420,10 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         return decline("a drafter tensor is missing (Q8_0 projections / norms)");
     const core::NativeEmbed* nemb = core::native_embed();
     const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
-    if (!nemb && (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
-                  (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
+    const bool raw_emb = wemb && wemb->data && !wemb->quantized() &&
+                         (wemb->kind == core::WeightKind::Bf16InF32 || wemb->kind == core::WeightKind::F16InF32);
+    if (!nemb && (wemb == nullptr || wemb->ne0 != g.n_embd || (!raw_emb && (wemb->codebook_iq4nl || wemb->group_elems <= 0 ||
+                  (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))))
         return decline("the token embedding is not gatherable on this path");
     // the cells the drafter's window can still reach
     const int64_t r0 = std::max<int64_t>(0, mtp.first_needed() - cell0);
@@ -1499,6 +1502,9 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         // the input branches: the next token's embedding, and this cell's final residual rows
         if (nemb) {
             nemb->gather_dev(tok, nb, emb, m.cs);
+        } else if (raw_emb) {
+            strata::kernels::exl3_embed_gather_rows((const uint16_t*) wemb->data, wemb->ne0, wemb->ne1,
+                wemb->kind == core::WeightKind::Bf16InF32, tok, (int) nb, emb, m.cs);
         } else {
             const auto* codes = (const uint8_t*) wemb->data;
             const auto* scales = (const float*) (codes + wemb->codes_bytes);
@@ -2197,9 +2203,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         bool batched = hand_in_ == nullptr && m.tok_dev != nullptr;
         const core::NativeEmbed* nemb = core::native_embed();
         const core::WeightRef* wemb = nemb ? nullptr : m.wt->find("token_embd.weight");
+        const bool raw_emb = wemb && wemb->data && !wemb->quantized() &&
+                             (wemb->kind == core::WeightKind::Bf16InF32 || wemb->kind == core::WeightKind::F16InF32);
         if (batched && nemb == nullptr &&
-            (wemb == nullptr || wemb->codebook_iq4nl || wemb->ne0 != g.n_embd || wemb->group_elems <= 0 ||
-             (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))
+            (wemb == nullptr || wemb->ne0 != g.n_embd || (!raw_emb && (wemb->codebook_iq4nl || wemb->group_elems <= 0 ||
+             (wemb->code_bits != 2 && wemb->code_bits != 4 && wemb->code_bits != 8)))))
             batched = false;
         for (int64_t t = 0; batched && t < T; ++t) {
             const int64_t tok = tokens[c0 + t];
@@ -2213,6 +2221,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             if (nemb) {
                 nemb->gather_dev(m.tok_dev, T, m.emb, m.cs);
+            } else if (raw_emb) {
+                strata::kernels::exl3_embed_gather_rows((const uint16_t*) wemb->data, wemb->ne0, wemb->ne1,
+                    wemb->kind == core::WeightKind::Bf16InF32, m.tok_dev, (int) T, m.emb, m.cs);
             } else {
                 const auto* codes = (const uint8_t*) wemb->data;
                 const auto* scales = (const float*) (codes + wemb->codes_bytes);
@@ -3020,6 +3031,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // so it can overlap CPU grouping and the routed-only path's initial expert uploads.
                     const bool defer_shared = !stream_all && stream_ahead_enabled();
                     if (!defer_shared && !shared_expert()) return false;
+                    if (exl3_experts_) {
+                        if (defer_shared && !shared_expert()) return false;
+                        m.ids_host.resize((size_t) T * K);
+                        if (cudaMemcpyAsync(m.ids_host.data(), m.ids, (size_t) T * K * sizeof(int32_t),
+                                            cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
+                            cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                            err = "prefill: EXL3 routing readback failed"; return false;
+                        }
+                        if (!exl3_experts_->run_device((int) l, m.mixed, m.ids_host.data(), (int) T, K, m.Dm, m.cs)) {
+                            err = "prefill: EXL3 grouped FFN failed at layer " + std::to_string(l); return false;
+                        }
+                        m.slot_host.resize((size_t) T * K);
+                        for (size_t i = 0; i < m.slot_host.size(); ++i) m.slot_host[i] = (int32_t) i;
+                        if (cudaMemcpyAsync(m.slot_dev, m.slot_host.data(), (size_t) T * K * sizeof(int32_t),
+                                            cudaMemcpyHostToDevice, m.cs) != cudaSuccess) {
+                            err = "prefill: EXL3 row map upload failed"; return false;
+                        }
+                        moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+                    } else {
                     // #136: STRATA_PF_FUSED=1 - the Q2_0 pack's experts on the fused int8 kernels (moe_fused.hpp),
                     // grouped on the GPU: no host sync.  Only where every expert's place is known before the routing -
                     // the streamed walk, in which every non-resident expert of the layer comes through the ring in id
@@ -4080,6 +4110,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                 }
+                    }
                 // ---- the hyper-connection write of this half; F-2: fused with the next half's norm when nothing else
                 // touches R in between (not the stage's last half, not before the PLE block of layer 1, not under a
                 // control vector)

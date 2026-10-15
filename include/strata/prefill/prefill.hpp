@@ -24,6 +24,7 @@
 
 namespace strata::core { class PeerExperts; }
 namespace strata::kernels::cpu { class ExpertPool; }
+namespace strata::kernels { class Exl3ExpertStream; }
 
 namespace strata::prefill {
 
@@ -127,6 +128,7 @@ public:
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    void set_exl3_experts(kernels::Exl3ExpertStream* experts) { exl3_experts_ = experts; }
 
     const PrefillStats& stats() const { return stats_; }
 
@@ -191,6 +193,7 @@ private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
+    kernels::Exl3ExpertStream* exl3_experts_ = nullptr;
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);

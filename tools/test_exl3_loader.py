@@ -108,18 +108,27 @@ class CommandLineTests(unittest.TestCase):
                 self.assertIn("choose one", result.stderr)
 
     def test_unsupported_modes_fail_before_loading(self):
-        for args in (("--spec", "2"), ("--batch", "2"), ("--layer-split", "auto"),
+        for args in (("--layer-split", "auto"),
                      ("--native", "fake.gguf")):
             with self.subTest(args=args):
                 result = self.engine("--exl3", "fake", "--no-ple", *args)
                 self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertIn("--exl3 supports single-GPU", result.stderr)
+                self.assertIn("--exl3 does not yet accept", result.stderr)
 
     def test_help_lists_exl3(self):
         result = self.engine("--help")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--exl3 DIR", result.stderr + result.stdout)
         self.assertIn("--ple-exl3 FILE", result.stderr + result.stdout)
+
+    def test_diagnostic_dense_modes_are_rejected_for_windows(self):
+        for dense in ("exl3", "only:output"):
+            with self.subTest(dense=dense):
+                result = subprocess.run([os.environ["STRATA_EXL3_ENGINE"], "--exl3", "fake",
+                                         "--no-ple", "--tokens", "1", "--spec", "4"],
+                    env={**os.environ, "STRATA_EXL3_DENSE": dense}, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("unset STRATA_EXL3_DENSE", result.stderr)
 
 
 if __name__ == "__main__":

@@ -4,8 +4,8 @@
     python3 tools/exl3/tokenizer_to_pack.py --hf <hf_model_dir> --out <pack_dir>
 
 The HF model has `tokenizer.json` (base vocab + added tokens), `merges.txt`, `tokenizer_config.json`,
-`chat_template.jinja`, and `config.json` (embedding rows).  The pack wants `vocab.json` (id -> token
-list), `merges.txt`, `token_type.json` (ggml token types), `tokenizer.json` (config), and the template.
+`chat_template.jinja`, and `config.json` (embedding rows).  The pack wants `vocab.json` (token -> id
+map), `merges.txt`, `token_type.json` (ggml token types), `tokenizer.json` (config), and the template.
 The BPE is identical to the GGUF's (247,587 merges, `qwen35` pretokenizer), so no new C++ tokenizer is
 needed; this just reshapes the files.  See docs/EXL3.md and the research note in the PR.
 """
@@ -65,7 +65,7 @@ def main() -> int:
 
     out = pathlib.Path(args.out) / "tokenizer"
     out.mkdir(parents=True, exist_ok=True)
-    (out / "vocab.json").write_text(json.dumps(tokens, ensure_ascii=False), encoding="utf-8")
+    (out / "vocab.json").write_text(json.dumps({token: i for i, token in enumerate(tokens)}, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join(merges), encoding="utf-8")
     (out / "token_type.json").write_text(json.dumps(types), encoding="utf-8")
     pack_cfg = {

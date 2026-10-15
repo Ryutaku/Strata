@@ -26,6 +26,7 @@
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/route_prior.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -583,7 +584,11 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
         return false;
     }
-    if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
+    if (hits.external_experts && (hits.d_res || hits.cache_base || hits.h_res || hits.blob != 0)) {
+        err = "verify: external experts cannot use a GGUF residency table";
+        return false;
+    }
+    if (!hits.external_experts && (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0)) {
         err = "verify: needs the profile-filled VRAM expert tier (--expert-profile and --expert-cache); with "
               "--expert-cache auto, no VRAM was left for it - the 'no VRAM is left for the expert cache' line above "
               "says how much is short and what makes room (a smaller --max-context, --kv q4_0, setup --draft-vocab en, "
@@ -946,18 +951,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         broadcast_streams(emb_, R_, N, (int) HC, T, cs);
     } else {
         const WeightRef* w = wt.find("token_embd.weight");
-        if (w == nullptr || w->codebook_iq4nl || (w->code_bits != 2 && w->code_bits != 4 && w->code_bits != 8)) {
-            err = "verify: token_embd.weight is missing or not an S2/S4/S8 tensor";
-            return false;
+        if (w != nullptr && w->data != nullptr && !w->quantized() &&
+            (w->kind == WeightKind::Bf16InF32 || w->kind == WeightKind::F16InF32)) {
+            exl3_embed_gather_rows((const uint16_t*) w->data, w->ne0, w->ne1,
+                                    w->kind == WeightKind::Bf16InF32, tok_, T, emb_, cs);
+            broadcast_streams(emb_, R_, N, (int) HC, T, cs);
+        } else {
+            if (w == nullptr || w->codebook_iq4nl || (w->code_bits != 2 && w->code_bits != 4 && w->code_bits != 8)) {
+                err = "verify: token_embd.weight is missing or not an S2/S4/S8 tensor";
+                return false;
+            }
+            const auto* codes = (const uint8_t*) w->data;
+            const auto* scales = (const float*) (codes + w->codes_bytes);
+            const auto* offsets = w->has_offset ? (const float*) (codes + w->codes_bytes + w->scales_bytes) : nullptr;
+            const uint64_t row_codes = (uint64_t) (w->ne0 / (8 / w->code_bits));
+            const uint64_t row_groups = (uint64_t) (w->ne0 / w->group_elems);
+            embedding_gather_dev(codes, scales, offsets, tok_, T, w->ne0, w->code_bits, w->code_bias, w->group_elems,
+                                 row_codes, row_groups, emb_, cs);
+            broadcast_streams(emb_, R_, N, (int) HC, T, cs);
         }
-        const auto* codes = (const uint8_t*) w->data;
-        const auto* scales = (const float*) (codes + w->codes_bytes);
-        const auto* offsets = w->has_offset ? (const float*) (codes + w->codes_bytes + w->scales_bytes) : nullptr;
-        const uint64_t row_codes = (uint64_t) (w->ne0 / (8 / w->code_bits));
-        const uint64_t row_groups = (uint64_t) (w->ne0 / w->group_elems);
-        embedding_gather_dev(codes, scales, offsets, tok_, T, w->ne0, w->code_bits, w->code_bias, w->group_elems,
-                             row_codes, row_groups, emb_, cs);
-        broadcast_streams(emb_, R_, N, (int) HC, T, cs);
     }
 
     // per-layer state indices (GDN and QSA layers are numbered separately)
@@ -1575,11 +1587,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             if (sh_fork) cudaEventRecord(ev_join_, sh_cs_);
         }
-        if (strata::kernels::cpu::expert_layout().native) {
-            if (!qdedup)
-                if (!q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
-        } else
-            quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
+        if (!hits_.external_experts) {
+            if (strata::kernels::cpu::expert_layout().native) {
+                if (!qdedup)
+                    if (!q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+            } else
+                quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
+        }
         stamp(l, 18, grp);
         return true;
     };
@@ -1622,7 +1636,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         bool hits_in_combine = false;
-        if (ar_on()) {
+        if (hits_.external_experts) {
+            wait_flag_ge(m_flag_, ring, cs);
+            copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
+        } else if (ar_on()) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
             stamp(l, 20, grp);

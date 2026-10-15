@@ -266,8 +266,9 @@ Build with the normal CUDA configuration and `-DSTRATA_BUILD_TESTS=ON`, then run
 `ctest --test-dir <build> -R exl3 --output-on-failure`. The model checker also exercises malformed
 shapes, truncated tensor ranges and unsupported half-integer rates before a decode kernel runs.
 
-The EXL3 path currently uses the single-token expert callback. Use one GPU, `--spec 0` and the
-normal graph-capture path. `--batch`, `--layer-split` and GGUF native-weight overrides are rejected.
+The CUDA path supports verifier windows, a compatible packed MTP drafter, batch sessions and
+explicit multi-GPU layer boundaries. The validation record above includes configuration and
+reproduction commands. Automatic layer splitting and GGUF native-weight overrides are rejected.
 `--no-capture --no-pool` is a diagnostic dense-only run, not a complete model inference.
 Choose exactly one PLE source (`--ple-exl3` or `--ple-gguf`); `--no-ple` is an explicit ablation.
 

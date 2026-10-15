@@ -35,15 +35,44 @@ struct Exl3Mat {
     int ki = 0, nj = 0, bits = 0, cb = 2;
 };
 
+// Scratch belongs to one ordered execution context. Distinct concurrent streams/devices must use
+// distinct workspaces; expert weights remain shareable. Reserve before capture or timed execution.
+class Exl3MoeWorkspace {
+public:
+    Exl3MoeWorkspace();
+    ~Exl3MoeWorkspace();
+    Exl3MoeWorkspace(const Exl3MoeWorkspace&) = delete;
+    Exl3MoeWorkspace& operator=(const Exl3MoeWorkspace&) = delete;
+    void reserve(int routes, int n_in, int n_ff, int n_out, bool indexed = false);
+    struct Impl;
+    Impl& implementation();
+private:
+    Impl* impl_ = nullptr;
+};
+
 // One routed expert's FFN for a single token: out = down(silu(gate(x)) * up(x)), accumulated over
 // `n_experts` experts weighted by `weights`.  x: ki*16 fp16; out: down[].nj*16 fp16.  stream may be null.
 void exl3_moe_ffn(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down, const float* weights,
-                  int n_experts, const uint16_t* x, uint16_t* out, void* stream);
+                  int n_experts, const uint16_t* x, uint16_t* out, void* stream, Exl3MoeWorkspace* workspace = nullptr);
 
 // The same FFN for a subset of the experts, written as `k` rows of `n` fp16 into the caller's buffer (the
 // resident/miss split: the resident half can run while the missing experts are still being read).
 void exl3_moe_rows_part(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down, int k, const uint16_t* x,
-                        uint16_t* out, void* stream);
+                        uint16_t* out, void* stream, Exl3MoeWorkspace* workspace = nullptr);
+
+// Multi-token counterpart. Matrices are HOST descriptors in route order; input_rows is a DEVICE
+// array of route-count token indices. x is DEVICE [tokens, gate[0].ki*16], out is DEVICE
+// [routes, down[0].nj*16]. Repeated experts share weight pointers and can consume different tokens.
+void exl3_moe_rows_indexed(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down, int routes,
+                           const uint16_t* x, const int* input_rows, uint16_t* out, void* stream,
+                           Exl3MoeWorkspace& workspace);
+
+// One expert, many token rows: reconstruct its three weights once and use FP16 tensor-core GEMMs
+// with FP32 accumulation. For prefill outside a waiting verifier graph; may grow workspace.
+// input_rows is DEVICE [rows]; out is DEVICE float [rows, down.nj*16].
+void exl3_moe_group_gemm(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& down, int rows,
+                         const uint16_t* x, const int* input_rows, float* out, void* stream,
+                         Exl3MoeWorkspace& workspace);
 
 // Put the two parts' rows back in the token's order: `out[a_row[r]] = a[r]`, `out[b_row[r]] = b[r]`.
 void exl3_rows_scatter(const uint16_t* a, const int* a_row, int na, const uint16_t* b, const int* b_row, int nb,
@@ -53,11 +82,14 @@ void exl3_rows_scatter(const uint16_t* a, const int* a_row, int na, const uint16
 // The engine's expert pool returns k rows and applies the router weights later (`moe_combine`), so this is the
 // shape it needs.  x: ki*16 fp16; out: k rows of down[].nj*16 fp16.
 void exl3_moe_rows(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down, const int* ids,
-                   int k, const uint16_t* x, uint16_t* out, void* stream);
+                   int k, const uint16_t* x, uint16_t* out, void* stream, Exl3MoeWorkspace* workspace = nullptr);
 
 // Gather one embedding row stored as F16 (bf16=false) or BF16 (bf16=true) into f32.  The EXL3 model's
 // token_embd is BF16; the engine's `embed_row` otherwise requires an S2/S4/S8 table.
 void exl3_embed_gather(const uint16_t* row, int64_t n, bool bf16, float* out, void* stream);
+// Device token ids; invalid ids yield zeros (the host verifier validates request tokens).
+void exl3_embed_gather_rows(const uint16_t* table, int64_t n_embd, int64_t n_vocab, bool bf16,
+                            const int32_t* tokens, int rows, float* out, void* stream);
 
 // The MoE shared expert for EXL3 weights: out = (down(silu(gate(x)) * up(x))) * sigmoid(w_ginp . x).
 void exl3_shared_reserve(int n_ff);

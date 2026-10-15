@@ -6,6 +6,7 @@
 #include <vector>
 
 namespace strata::core {
+struct WeightRef;
 
 /// Opt-in native output projection. Uploads unchanged GGUF blocks once at startup and owns its
 /// activation scratch. The normal canonical head remains available for numerical A/B comparisons.
@@ -20,6 +21,9 @@ public:
     NativeHead& operator=(const NativeHead&) = delete;
 
     bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err);
+    // Borrow an already loaded native projection, e.g. the EXL3 loader's reconstructed Q8 output.
+    // The WeightTable owner must outlive this head. Only activation scratch is owned here.
+    bool bind(const WeightRef& weight, std::string& err);
     void unload();
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
     uint64_t weight_bytes() const { return bytes_; }
@@ -39,6 +43,7 @@ private:
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;
     int device_ = -1;
+    bool owns_weights_ = true;
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row
