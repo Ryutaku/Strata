@@ -11,6 +11,12 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <limits>
+#include <map>
+#include <memory>
+#include <cublas_v2.h>
+#include <stdexcept>
 
 namespace strata::kernels {
 namespace {
@@ -391,7 +397,7 @@ __global__ void f16_to_f32_kernel(const uint16_t* __restrict__ h, float* __restr
 
 __global__ void prescale_batched_kernel(const uint16_t* __restrict__ x, long x_stride,
                                         const Exl3Mat* __restrict__ mats, float* __restrict__ xh, int k,
-                                        float* __restrict__ zero, long nz) {
+                                        float* __restrict__ zero, long nz, const int* input_rows = nullptr) {
     __shared__ float b[HAD];
     int e = blockIdx.y, t = threadIdx.x, idx = blockIdx.x * HAD + t;
     // **THE ZEROING RIDES ALONG WITH THE PRESCALE.**  The GEMV accumulates with atomics, so its output must be
@@ -403,7 +409,8 @@ __global__ void prescale_batched_kernel(const uint16_t* __restrict__ x, long x_s
         const long stride = (long) gridDim.x * gridDim.y * HAD;
         for (long i = (long) (blockIdx.y * gridDim.x + blockIdx.x) * HAD + t; i < nz; i += stride) zero[i] = 0.0f;
     }
-    b[t] = dh2f(x[e * x_stride + idx]) * dh2f(mats[e].suh[idx]);
+    const long input_row = input_rows ? input_rows[e] : e;
+    b[t] = dh2f(x[input_row * x_stride + idx]) * dh2f(mats[e].suh[idx]);
     __syncthreads();
     for (int step = 1; step < HAD; step <<= 1) {
         if ((t & step) == 0) { float a = b[t], d = b[t | step]; b[t] = a + d; b[t | step] = a - d; }
@@ -412,7 +419,7 @@ __global__ void prescale_batched_kernel(const uint16_t* __restrict__ x, long x_s
     xh[(long)e * k + idx] = b[t] * 0.08838834764831845f;
 }
 
-template <int T>
+template <int T, bool Partials = false>
 __global__ void __launch_bounds__(256, 6) gemv_batched_kernel(const float* __restrict__ xh, const Exl3Mat* __restrict__ mats,
                                     const int* __restrict__ pinv, float* __restrict__ z) {
     int e = blockIdx.z;
@@ -473,16 +480,20 @@ __global__ void __launch_bounds__(256, 6) gemv_batched_kernel(const float* __res
             float s = 0;
             #pragma unroll
             for (int k2 = 0; k2 < 16; ++k2) s += red[t][k2][c];
-            atomicAdd(&z[(long)e * (nj * 16) + j * 16 + c], s);
+            if constexpr (Partials)
+                z[((long) e * gridDim.y + blockIdx.y) * (nj * 16) + j * 16 + c] = s;
+            else atomicAdd(&z[(long)e * (nj * 16) + j * 16 + c], s);
         }
     }
 }
 
 __global__ void postscale_batched_kernel(const float* __restrict__ z, const Exl3Mat* __restrict__ mats,
-                                         uint16_t* __restrict__ y, int n) {
+                                         uint16_t* __restrict__ y, int n, int parts = 1) {
     __shared__ float b[HAD];
     int e = blockIdx.y, t = threadIdx.x, idx = blockIdx.x * HAD + t;
-    b[t] = z[(long)e * n + idx];
+    float value = z[(long) e * parts * n + idx];
+    for (int p = 1; p < parts; ++p) value += z[((long) e * parts + p) * n + idx];
+    b[t] = value;
     __syncthreads();
     for (int step = 1; step < HAD; step <<= 1) {
         if ((t & step) == 0) { float a = b[t], d = b[t | step]; b[t] = a + d; b[t | step] = a - d; }
@@ -512,96 +523,292 @@ __global__ void accum_out_kernel(const uint16_t* __restrict__ d, const float* __
 }  // namespace
 
 
+// Mutable MoE scratch belongs to an execution context, not to the process. Element capacities
+// include the route count so a 3-expert hit partition followed by 10 misses cannot overrun scratch.
 namespace {
+template <typename T> struct MoeBuffer {
+    T* p = nullptr;
+    size_t capacity = 0;
+    void reserve(size_t count) {
+        if (count <= capacity) return;
+        if (count > std::numeric_limits<size_t>::max() / sizeof(T))
+            throw std::overflow_error("exl3 MoE workspace size overflow");
+        T* next = nullptr;
+        if (cudaMalloc((void**) &next, count * sizeof(T)) != cudaSuccess)
+            throw std::runtime_error("exl3 MoE workspace allocation failed");
+        (void) cudaFree(p);
+        p = next;
+        capacity = count;
+    }
+    ~MoeBuffer() { if (p) (void) cudaFree(p); }
+};
+}
 
-// Run gate/up/silu/down for every expert (batched, grid.z = expert) and return the process-wide device fp16
-// buffer holding each expert's down output (n_experts x n).  Shared by the weighted `exl3_moe_ffn` and the
-// unweighted `exl3_moe_rows`.
+struct Exl3MoeWorkspace::Impl {
+    int device = -1;
+    MoeBuffer<Exl3Mat> gate, up, down;
+    MoeBuffer<uint16_t> g, u, h, d;
+    MoeBuffer<float> xh, z, weights, partials;
+    MoeBuffer<int> pinv;
+    MoeBuffer<uint16_t> group_x, group_weight;
+    MoeBuffer<float> group_y, group_reconstruct;
+    cublasHandle_t blas = nullptr;
+    Impl() { if (cudaGetDevice(&device) != cudaSuccess) throw std::runtime_error("exl3: no CUDA device"); }
+    ~Impl() { if (blas) (void) cublasDestroy(blas); }
+};
+
+Exl3MoeWorkspace::Exl3MoeWorkspace() : impl_(new Impl) {}
+Exl3MoeWorkspace::~Exl3MoeWorkspace() {
+    int previous = -1;
+    (void) cudaGetDevice(&previous);
+    (void) cudaSetDevice(impl_->device);
+    delete impl_;
+    if (previous != -1) (void) cudaSetDevice(previous);
+}
+Exl3MoeWorkspace::Impl& Exl3MoeWorkspace::implementation() { return *impl_; }
+void Exl3MoeWorkspace::reserve(int routes, int n_in, int n_ff, int n_out, bool indexed) {
+    int device = -1;
+    if (routes < 1 || n_in < 1 || n_ff < 1 || n_out < 1 ||
+        cudaGetDevice(&device) != cudaSuccess || device != impl_->device)
+        throw std::invalid_argument("exl3: workspace geometry/device mismatch");
+    auto& w = *impl_;
+    const size_t r = (size_t) routes;
+    w.gate.reserve(r); w.up.reserve(r); w.down.reserve(r); w.weights.reserve(r);
+    w.g.reserve(r * (size_t) n_ff); w.u.reserve(r * (size_t) n_ff); w.h.reserve(r * (size_t) n_ff);
+    w.d.reserve(r * (size_t) n_out);
+    w.xh.reserve(r * (size_t) std::max(n_in, n_ff));
+    w.z.reserve(r * (size_t) std::max(n_ff, n_out));
+    if (indexed) {
+        const size_t gate_parts = ((size_t) n_in + 255) / 256;
+        const size_t down_parts = ((size_t) n_ff + 255) / 256;
+        w.partials.reserve(r * std::max(gate_parts * (size_t) n_ff, down_parts * (size_t) n_out));
+    }
+    if (!w.pinv.p) {
+        w.pinv.reserve(256);
+        int pinv[256]; build_pinv(pinv);
+        if (cudaMemcpy(w.pinv.p, pinv, sizeof pinv, cudaMemcpyHostToDevice) != cudaSuccess)
+            throw std::runtime_error("exl3: permutation upload failed");
+    }
+}
+
+namespace {
+// Standalone compatibility callers get distinct scratch for each device, stream and host thread.
+// The engine uses explicitly owned workspaces, whose lifetime matches its expert stream.
+Exl3MoeWorkspace& fallback_moe_workspace(cudaStream_t stream) {
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) throw std::runtime_error("exl3: no CUDA device");
+    using Key = std::pair<int, uintptr_t>;
+    static thread_local std::map<Key, std::unique_ptr<Exl3MoeWorkspace>> workspaces;
+    auto& item = workspaces[{device, reinterpret_cast<uintptr_t>(stream)}];
+    if (!item) item = std::make_unique<Exl3MoeWorkspace>();
+    return *item;
+}
+
 uint16_t* moe_run_experts(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down, int n_experts,
-                          const uint16_t* x, cudaStream_t st) {
+                          const uint16_t* x, cudaStream_t st, Exl3MoeWorkspace* workspace,
+                          long x_stride = 0, const int* input_rows = nullptr) {
+    if (!gate || !up || !down || !x || n_experts <= 0 || n_experts > 65535)
+        throw std::invalid_argument("exl3: invalid FFN arguments");
+    for (int e = 0; e < n_experts; ++e) {
+        for (const Exl3Mat* m : {&gate[e], &up[e], &down[e]})
+            if (!m->trellis || !m->suh || !m->svh || m->ki <= 0 || m->ki > INT32_MAX / 16 ||
+                m->nj <= 0 || m->nj > INT32_MAX / 16 || m->ki % 8 || m->nj % 8 ||
+                m->bits < 1 || m->bits > 8 || m->cb < 0 || m->cb > 2)
+                throw std::invalid_argument("exl3: invalid FFN matrix geometry");
+        if (gate[e].ki != gate[0].ki || gate[e].nj != gate[0].nj || up[e].ki != gate[0].ki ||
+            up[e].nj != gate[0].nj || down[e].ki != gate[0].nj || down[e].nj != down[0].nj)
+            throw std::invalid_argument("exl3: mixed FFN dimensions");
+    }
     const int k = gate[0].ki * 16;
     const int ff = gate[0].nj * 16;
     const int n = down[0].nj * 16;
-    const int maxk = k > ff ? k : ff;      // xh: gate/up transform k, down transforms ff
-    const int maxn = ff > n ? ff : n;      // z: gate/up produce ff, down produces n
-    static Exl3Mat* d_gate = nullptr; static Exl3Mat* d_up = nullptr; static Exl3Mat* d_down = nullptr;
-    static int cne = 0;
-    size_t msz = (size_t) n_experts * sizeof(Exl3Mat);
-    if (n_experts > cne) {
-        (void)cudaFree(d_gate); (void)cudaFree(d_up); (void)cudaFree(d_down);
-        d_gate = d_up = d_down = nullptr;
-        if (cudaMalloc((void**)&d_gate, msz) || cudaMalloc((void**)&d_up, msz) || cudaMalloc((void**)&d_down, msz)) {
-            const cudaError_t me = cudaGetLastError(); size_t fb=0,tb=0; const cudaError_t gi = cudaMemGetInfo(&fb,&tb); std::fprintf(stderr, "exl3_moe: cudaMalloc(msz=%zu) failed: %s; meminfo rc=%s %zu/%zu MiB\n", msz, cudaGetErrorString(me), cudaGetErrorString(gi), fb>>20, tb>>20); std::abort();
-        }
-        cne = n_experts;
-    }
+    auto& owner = workspace ? *workspace : fallback_moe_workspace(st);
+    owner.reserve(n_experts, k, ff, n, input_rows != nullptr);
+    auto& w = owner.implementation();
+    Exl3Mat* d_gate = w.gate.p; Exl3Mat* d_up = w.up.p; Exl3Mat* d_down = w.down.p;
+    const size_t msz = (size_t) n_experts * sizeof(Exl3Mat);
     (void)cudaMemcpyAsync(d_gate, gate, msz, cudaMemcpyHostToDevice, st);
     (void)cudaMemcpyAsync(d_up, up, msz, cudaMemcpyHostToDevice, st);
     (void)cudaMemcpyAsync(d_down, down, msz, cudaMemcpyHostToDevice, st);
-    static uint16_t* d_g = nullptr; static uint16_t* d_u = nullptr; static uint16_t* d_h = nullptr;
-    static uint16_t* d_d = nullptr; static float* d_xh = nullptr; static float* d_z = nullptr; static int* d_pinv = nullptr;
-    static int cff = 0, cn = 0, cmk = 0, cmn = 0;
-    if (ff > cff) {
-        (void)cudaFree(d_g); (void)cudaFree(d_u); (void)cudaFree(d_h); d_g = d_u = d_h = nullptr;
-        if (cudaMalloc((void**)&d_g, (size_t)ff * n_experts * 2) || cudaMalloc((void**)&d_u, (size_t)ff * n_experts * 2) ||
-            cudaMalloc((void**)&d_h, (size_t)ff * n_experts * 2)) {
-            size_t fb=0,tb=0; cudaMemGetInfo(&fb,&tb);
-            std::fprintf(stderr, "exl3_moe: cudaMalloc(ff=%d k=%d -> %.1f MiB) failed: %zu MiB free of %zu MiB\n", ff, n_experts, (double)ff*n_experts*2*3/(1<<20), fb>>20, tb>>20);
-            std::abort(); }
-        cff = ff;
-    }
-    if (n > cn) {
-        (void)cudaFree(d_d); d_d = nullptr;
-        if (cudaMalloc((void**)&d_d, (size_t)n * n_experts * 2)) { std::fprintf(stderr, "exl3_moe: cudaMalloc failed\n"); std::abort(); }
-        cn = n;
-    }
-    if (maxk * n_experts > cmk) { (void)cudaFree(d_xh); d_xh = nullptr; if (cudaMalloc((void**)&d_xh, (size_t)maxk * n_experts * 4)) std::abort(); cmk = maxk * n_experts; }
-    if (maxn * n_experts > cmn) { (void)cudaFree(d_z); d_z = nullptr; if (cudaMalloc((void**)&d_z, (size_t)maxn * n_experts * 4)) std::abort(); cmn = maxn * n_experts; }
-    if (!d_pinv) { if (cudaMalloc((void**)&d_pinv, 256 * 4)) std::abort(); int pinv[256]; build_pinv(pinv); (void)cudaMemcpy(d_pinv, pinv, 256 * 4, cudaMemcpyHostToDevice); }
+    uint16_t* d_g = w.g.p; uint16_t* d_u = w.u.p; uint16_t* d_h = w.h.p; uint16_t* d_d = w.d.p;
+    float* d_xh = w.xh.p; float* d_z = w.z.p; int* d_pinv = w.pinv.p;
     int gy_g = (gate[0].ki + 15) / 16; if (gy_g < 1) gy_g = 1;
     int gy_d = (down[0].ki + 15) / 16; if (gy_d < 1) gy_d = 1;
-    prescale_batched_kernel<<<dim3(k / HAD, n_experts), HAD, 0, st>>>(x, 0, d_gate, d_xh, k, d_z, (long) n_experts * ff);
-    gemv_batched_kernel<GEMV_T><<<dim3((ff / 16 + GEMV_T - 1) / GEMV_T, gy_g, n_experts), 256, 0, st>>>(d_xh, d_gate, d_pinv, d_z);
-    postscale_batched_kernel<<<dim3(ff / HAD, n_experts), HAD, 0, st>>>(d_z, d_gate, d_g, ff);
-    prescale_batched_kernel<<<dim3(k / HAD, n_experts), HAD, 0, st>>>(x, 0, d_up, d_xh, k, d_z, (long) n_experts * ff);
-    gemv_batched_kernel<GEMV_T><<<dim3((ff / 16 + GEMV_T - 1) / GEMV_T, gy_g, n_experts), 256, 0, st>>>(d_xh, d_up, d_pinv, d_z);
-    postscale_batched_kernel<<<dim3(ff / HAD, n_experts), HAD, 0, st>>>(d_z, d_up, d_u, ff);
+    // Indexed windows already expose route-level parallelism. An optional smaller K split
+    // amortizes trellis-window setup and reduces atomics; keep the established path by default.
+    if (input_rows) {
+        static const int cap = [] {
+            const char* value = std::getenv("STRATA_EXL3_GEMV_SPLIT");
+            return value ? std::max(1, std::min(16, std::atoi(value))) : std::numeric_limits<int>::max();
+        }();
+        gy_g = std::min(gy_g, cap); gy_d = std::min(gy_d, cap);
+    }
+    auto project = [&](Exl3Mat* mats, int outputs, int parts, uint16_t* out) {
+        const dim3 grid((outputs / 16 + GEMV_T - 1) / GEMV_T, parts, n_experts);
+        if (input_rows) {
+            // Each K partition has its own output. The Hadamard pass sums them in a fixed order,
+            // so a route's result does not depend on the other slots or CUDA block scheduling.
+            gemv_batched_kernel<GEMV_T, true><<<grid, 256, 0, st>>>(d_xh, mats, d_pinv, w.partials.p);
+            postscale_batched_kernel<<<dim3(outputs / HAD, n_experts), HAD, 0, st>>>(w.partials.p, mats, out, outputs, parts);
+        } else {
+            gemv_batched_kernel<GEMV_T><<<grid, 256, 0, st>>>(d_xh, mats, d_pinv, d_z);
+            postscale_batched_kernel<<<dim3(outputs / HAD, n_experts), HAD, 0, st>>>(d_z, mats, out, outputs);
+        }
+    };
+    prescale_batched_kernel<<<dim3(k / HAD, n_experts), HAD, 0, st>>>(x, x_stride, d_gate, d_xh, k, d_z, (long) n_experts * ff, input_rows);
+    project(d_gate, ff, gy_g, d_g);
+    prescale_batched_kernel<<<dim3(k / HAD, n_experts), HAD, 0, st>>>(x, x_stride, d_up, d_xh, k, d_z, (long) n_experts * ff, input_rows);
+    project(d_up, ff, gy_g, d_u);
     { long tot = (long)n_experts * ff; silu_batched_kernel<<<(unsigned)((tot + 255) / 256), 256, 0, st>>>(d_g, d_u, d_h, tot); }
     prescale_batched_kernel<<<dim3(ff / HAD, n_experts), HAD, 0, st>>>(d_h, ff, d_down, d_xh, ff, d_z, (long) n_experts * n);
-    gemv_batched_kernel<GEMV_T><<<dim3((n / 16 + GEMV_T - 1) / GEMV_T, gy_d, n_experts), 256, 0, st>>>(d_xh, d_down, d_pinv, d_z);
-    postscale_batched_kernel<<<dim3(n / HAD, n_experts), HAD, 0, st>>>(d_z, d_down, d_d, n);
+    project(d_down, n, gy_d, d_d);
     return d_d;
 }
 
 }  // namespace
 
 void exl3_moe_ffn(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down, const float* weights,
-                  int n_experts, const uint16_t* x, uint16_t* out, void* stream) {
+                  int n_experts, const uint16_t* x, uint16_t* out, void* stream, Exl3MoeWorkspace* workspace) {
     if (n_experts <= 0) return;
     cudaStream_t st = (cudaStream_t) stream;
     const int n = down[0].nj * 16;
-    uint16_t* d_d = moe_run_experts(gate, up, down, n_experts, x, st);
-    static float* d_acc = nullptr; static float* d_weights = nullptr; static int cw = 0, ca = 0;
-    if (n > ca) { (void)cudaFree(d_acc); d_acc = nullptr; if (cudaMalloc((void**)&d_acc, (size_t)n * 4)) std::abort(); ca = n; }
-    if (n_experts > cw) { (void)cudaFree(d_weights); d_weights = nullptr; if (cudaMalloc((void**)&d_weights, (size_t)n_experts * 4)) std::abort(); cw = n_experts; }
+    uint16_t* d_d = moe_run_experts(gate, up, down, n_experts, x, st, workspace);
+    auto& w = (workspace ? *workspace : fallback_moe_workspace(st)).implementation();
+    float* d_weights = w.weights.p;
     (void)cudaMemcpyAsync(d_weights, weights, (size_t)n_experts * 4, cudaMemcpyHostToDevice, st);
     // one kernel, not two: the accumulator's f32 buffer is never read by anything else
     accum_out_kernel<<<(n + 255) / 256, 256, 0, st>>>(d_d, d_weights, n_experts, n, out);
 }
 
 void exl3_moe_rows_part(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down, int k, const uint16_t* x,
-                        uint16_t* out, void* stream) {
+                        uint16_t* out, void* stream, Exl3MoeWorkspace* workspace) {
     if (k <= 0) return;
     cudaStream_t st = (cudaStream_t) stream;
     const int n = down[0].nj * 16;
-    uint16_t* d_d = moe_run_experts(gate, up, down, k, x, st);
+    uint16_t* d_d = moe_run_experts(gate, up, down, k, x, st, workspace);
     (void) cudaMemcpyAsync(out, d_d, (size_t)k * n * 2, cudaMemcpyDeviceToDevice, st);
 }
 
+void exl3_moe_rows_indexed(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down, int routes,
+                           const uint16_t* x, const int* input_rows, uint16_t* out, void* stream,
+                           Exl3MoeWorkspace& workspace) {
+    if (routes == 0) return;
+    if (routes < 0 || routes > 65535 || !gate || !up || !down || !x || !input_rows || !out)
+        throw std::invalid_argument("exl3: invalid indexed FFN arguments");
+    const auto st = (cudaStream_t) stream;
+    uint16_t* rows = moe_run_experts(gate, up, down, routes, x, st, &workspace,
+                                     (long) gate[0].ki * 16, input_rows);
+    if (cudaMemcpyAsync(out, rows, (size_t) routes * down[0].nj * 16 * sizeof(uint16_t),
+                        cudaMemcpyDeviceToDevice, st) != cudaSuccess)
+        throw std::runtime_error("exl3: indexed FFN output copy failed");
+}
+
+namespace {
+__global__ void decode_group_weight(Exl3Mat m, float* out) {
+    const int i = blockIdx.y, j = blockIdx.x, t = threadIdx.x;
+    const uint16_t* tw = m.trellis + (size_t) (i * m.nj + j) * 16 * m.bits;
+    const int group = t >> 3, slot = t & 7;
+    const int r0 = (group % 4) * 2, c0 = group / 4;
+    const int r = r0 + ((slot & 3) >= 2 ? 8 : 0) + (slot & 1);
+    const int c = c0 + (slot >= 4 ? 8 : 0);
+    out[(size_t) (i * 16 + r) * (m.nj * 16) + j * 16 + c] =
+        dh2f(decode_window(m.cb, (uint16_t) read_window(tw, t, m.bits)));
+}
+// Transform 32 columns together: contiguous loads/stores instead of a one-thread block's
+// 128 strided values. No allocation or global synchronisation between expert groups.
+__global__ void group_had_rows(float* w, int n) {
+    __shared__ float tile[HAD][32];
+    const int col = blockIdx.x * 32 + threadIdx.x, rb = blockIdx.y * HAD;
+    for (int r = threadIdx.y; r < HAD; r += blockDim.y) tile[r][threadIdx.x] = w[(size_t) (rb + r) * n + col];
+    __syncthreads();
+    for (int step = 1; step < HAD; step <<= 1) {
+        for (int r = threadIdx.y; r < HAD; r += blockDim.y)
+            if (!(r & step)) {
+                const float a = tile[r][threadIdx.x], b = tile[r | step][threadIdx.x];
+                tile[r][threadIdx.x] = a + b; tile[r | step][threadIdx.x] = a - b;
+            }
+        __syncthreads();
+    }
+    for (int r = threadIdx.y; r < HAD; r += blockDim.y)
+        w[(size_t) (rb + r) * n + col] = tile[r][threadIdx.x] * 0.08838834764831845f;
+}
+__global__ void group_had_cols_pack(const float* w, int n, const uint16_t* suh, const uint16_t* svh, uint16_t* out) {
+    __shared__ float tile[HAD];
+    const int r = blockIdx.x, col = blockIdx.y * HAD + threadIdx.x, t = threadIdx.x;
+    tile[t] = w[(size_t) r * n + col];
+    __syncthreads();
+    for (int step = 1; step < HAD; step <<= 1) {
+        if (!(t & step)) {
+            const float a = tile[t], b = tile[t | step];
+            tile[t] = a + b; tile[t | step] = a - b;
+        }
+        __syncthreads();
+    }
+    out[(size_t) r * n + col] = __half_as_ushort(__float2half_rn(
+        ((tile[t] * 0.08838834764831845f) * dh2f(suh[r])) * dh2f(svh[col])));
+}
+__global__ void gather_group_rows(const uint16_t* x, const int* input_rows, uint16_t* out, int rows, int n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < (int64_t) rows * n) out[i] = x[(int64_t) input_rows[i / n] * n + i % n];
+}
+__global__ void round_group_output(const float* in, float* out, int64_t count) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) out[i] = __half2float(__float2half_rn(in[i]));
+}
+}
+
+void exl3_moe_group_gemm(const Exl3Mat& gate, const Exl3Mat& up, const Exl3Mat& down, int rows,
+                         const uint16_t* x, const int* input_rows, float* out, void* stream,
+                         Exl3MoeWorkspace& workspace) {
+    for (const Exl3Mat* matrix : {&gate, &up, &down})
+        if (!matrix->trellis || !matrix->suh || !matrix->svh || matrix->bits < 1 || matrix->bits > 8 ||
+            matrix->cb < 0 || matrix->cb > 2 || matrix->ki <= 0 || matrix->ki > INT32_MAX / 16 ||
+            matrix->nj <= 0 || matrix->nj > INT32_MAX / 16 || matrix->ki % 8 || matrix->nj % 8)
+            throw std::invalid_argument("exl3: invalid grouped GEMM matrix");
+    if (rows <= 0 || rows > 65535 || !x || !input_rows || !out || gate.ki != up.ki || gate.nj != up.nj ||
+        down.ki != gate.nj || gate.ki <= 0 || gate.nj <= 0 || down.nj <= 0)
+        throw std::invalid_argument("exl3: invalid grouped GEMM geometry");
+    const int k = gate.ki * 16, ff = gate.nj * 16, n = down.nj * 16;
+    workspace.reserve(rows, k, ff, n);
+    auto& w = workspace.implementation();
+    w.group_x.reserve((size_t) rows * k);
+    w.group_weight.reserve(std::max((size_t) k * ff, (size_t) ff * n));
+    w.group_reconstruct.reserve(std::max((size_t) k * ff, (size_t) ff * n));
+    w.group_y.reserve((size_t) rows * std::max(ff, n));
+    const auto st = (cudaStream_t) stream;
+    if (!w.blas && cublasCreate(&w.blas) != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error("exl3: cannot create grouped GEMM handle");
+    if (cublasSetStream(w.blas, st) != CUBLAS_STATUS_SUCCESS)
+        throw std::runtime_error("exl3: cannot set grouped GEMM stream");
+    gather_group_rows<<<(unsigned) (((int64_t) rows * k + 255) / 256), 256, 0, st>>>(x, input_rows, w.group_x.p, rows, k);
+    auto project = [&](const Exl3Mat& m, const uint16_t* input) {
+        const int in = m.ki * 16, outputs = m.nj * 16;
+        decode_group_weight<<<dim3(m.nj, m.ki), 256, 0, st>>>(m, w.group_reconstruct.p);
+        group_had_rows<<<dim3(outputs / 32, in / HAD), dim3(32, 4), 0, st>>>(w.group_reconstruct.p, outputs);
+        group_had_cols_pack<<<dim3(in, outputs / HAD), HAD, 0, st>>>(
+            w.group_reconstruct.p, outputs, m.suh, m.svh, w.group_weight.p);
+        const float alpha = 1.0f, beta = 0.0f;
+        // Row-major W[in,out] is column-major W[out,in]; X[rows,in] is X[in,rows].
+        if (cublasGemmEx(w.blas, CUBLAS_OP_N, CUBLAS_OP_N, outputs, rows, in, &alpha,
+                         w.group_weight.p, CUDA_R_16F, outputs, input, CUDA_R_16F, in, &beta,
+                         w.group_y.p, CUDA_R_32F, outputs, CUBLAS_COMPUTE_32F,
+                         CUBLAS_GEMM_DEFAULT) != CUBLAS_STATUS_SUCCESS)
+            throw std::runtime_error("exl3: grouped tensor-core GEMM failed");
+    };
+    project(gate, w.group_x.p);
+    const int64_t hidden = (int64_t) rows * ff;
+    f32_to_f16_out_kernel<<<(unsigned) ((hidden + 255) / 256), 256, 0, st>>>(w.group_y.p, w.g.p, (int) hidden);
+    project(up, w.group_x.p);
+    f32_to_f16_out_kernel<<<(unsigned) ((hidden + 255) / 256), 256, 0, st>>>(w.group_y.p, w.u.p, (int) hidden);
+    silu_batched_kernel<<<(unsigned) ((hidden + 255) / 256), 256, 0, st>>>(w.g.p, w.u.p, w.h.p, hidden);
+    project(down, w.h.p);
+    round_group_output<<<(unsigned) (((int64_t) rows * n + 255) / 256), 256, 0, st>>>(w.group_y.p, out, (int64_t) rows * n);
+}
+
 void exl3_moe_rows(const Exl3Mat* gate, const Exl3Mat* up, const Exl3Mat* down, const int* ids,
-                   int k, const uint16_t* x, uint16_t* out, void* stream) {
+                   int k, const uint16_t* x, uint16_t* out, void* stream, Exl3MoeWorkspace* workspace) {
     (void) ids;   // the caller orders gate/up/down to match ids, so row i is expert ids[i]
-    exl3_moe_rows_part(gate, up, down, k, x, out, stream);
+    exl3_moe_rows_part(gate, up, down, k, x, out, stream, workspace);
 }
 
 // Scatter two f16 row blocks into the token's k rows (the order `moe_combine` expects): `dst[row]` takes
@@ -630,6 +837,27 @@ __global__ void embed_gather_kernel(const uint16_t* __restrict__ row, long n, in
     const uint16_t h = row[i];
     if (bf16) { uint32_t f = (uint32_t) h << 16; float o; __builtin_memcpy(&o, &f, 4); out[i] = o; }
     else out[i] = __half2float(*(const __half*) &h);
+}
+
+__global__ void embed_gather_rows_kernel(const uint16_t* table, int64_t n, int64_t vocab, bool bf16,
+                                        const int32_t* tokens, int rows, float* out) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t) rows * n) return;
+    const int32_t token = tokens[i / n];
+    float value = 0;
+    if (token >= 0 && token < vocab) {
+        const uint16_t h = table[(int64_t) token * n + i % n];
+        value = bf16 ? __uint_as_float((uint32_t) h << 16) : dh2f(h);
+    }
+    out[i] = value;
+}
+
+void exl3_embed_gather_rows(const uint16_t* table, int64_t n_embd, int64_t n_vocab, bool bf16,
+                            const int32_t* tokens, int rows, float* out, void* stream) {
+    if (!table || !tokens || !out || n_embd <= 0 || n_vocab <= 0 || rows <= 0)
+        throw std::invalid_argument("exl3: invalid embedding gather");
+    embed_gather_rows_kernel<<<(unsigned) (((int64_t) rows * n_embd + 255) / 256), 256, 0,
+                               (cudaStream_t) stream>>>(table, n_embd, n_vocab, bf16, tokens, rows, out);
 }
 
 

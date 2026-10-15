@@ -26,9 +26,12 @@ QUESTIONS = [
 def tokenizer(path):
     t = Path(path)
     vocab = json.loads((t / "vocab.json").read_text(encoding="utf-8"))
-    tokens = [None] * len(vocab)
-    for s, i in vocab.items():
-        tokens[i] = s
+    if isinstance(vocab, list):
+        tokens = vocab
+    else:
+        tokens = [None] * len(vocab)
+        for s, i in vocab.items():
+            tokens[i] = s
     merges = (t / "merges.txt").read_text(encoding="utf-8").split("\n")
     types = json.loads((t / "token_type.json").read_text())
     return ST.Tokenizer(tokens, merges, types)

@@ -11,6 +11,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -892,6 +893,10 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
         g_mp.stamp(0, cs);
         if (const NativeEmbed* ne = native_embed()) {   // plan v0.3 P6: the GGUF-form table
             ne->gather_dev(tok_, T, emb_, cs);
+        } else if (!we->quantized() && we->data &&
+                   (we->kind == WeightKind::Bf16InF32 || we->kind == WeightKind::F16InF32)) {
+            exl3_embed_gather_rows((const uint16_t*) we->data, we->ne0, we->ne1,
+                                    we->kind == WeightKind::Bf16InF32, tok_, T, emb_, cs);
         } else {
             const auto* codes = (const uint8_t*) we->data;
             const auto* scales = (const float*) (codes + we->codes_bytes);

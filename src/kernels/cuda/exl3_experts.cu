@@ -1,6 +1,8 @@
 // src/kernels/cuda/exl3_experts.cu - one layer's routed EXL3 experts on the GPU (see the header).
 #include "strata/kernels/exl3_experts.hpp"
 #include "strata/artifact/exl3_model.hpp"
+#include "strata/kernels/exl3_route_plan.hpp"
+#include "strata/platform/aux_cpus.hpp"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -34,6 +36,19 @@ namespace strata::kernels {
 struct Exl3ExpertStore::Impl {
     std::vector<Exl3Mat> gate, up, down;
     std::vector<void*> allocs;
+    std::unique_ptr<Exl3MoeWorkspace> workspace;
+    int device = -1;
+    Impl() {
+        if (cudaGetDevice(&device) != cudaSuccess) throw std::runtime_error("exl3: no CUDA device");
+        workspace = std::make_unique<Exl3MoeWorkspace>();
+    }
+    ~Impl() {
+        int previous = -1;
+        (void) cudaGetDevice(&previous); (void) cudaSetDevice(device);
+        for (void* p : allocs) (void) cudaFree(p);
+        workspace.reset();
+        if (previous >= 0) (void) cudaSetDevice(previous);
+    }
 };
 
 namespace {
@@ -61,36 +76,43 @@ Exl3Mat upload(const Exl3Linear& L, std::vector<void*>& allocs, cudaStream_t st,
 }  // namespace
 
 Exl3ExpertStore::Exl3ExpertStore(const std::string& model_dir, int layer, int n_experts, void* stream) {
-    impl_ = new Impl;
+    if (layer < 0 || layer >= 48 || n_experts <= 0 || n_experts > 512)
+        throw std::invalid_argument("exl3: invalid expert store geometry");
+    auto pending = std::make_unique<Impl>();
+    auto* state = pending.get();
     n_experts_ = n_experts;
     cudaStream_t st = (cudaStream_t) stream;
     Exl3Model m(model_dir);
     const std::string prefix = "model.language_model.layers." + std::to_string(layer) + ".mlp.experts.";
     for (int e = 0; e < n_experts; ++e) {
         const std::string b = prefix + std::to_string(e);
-        impl_->gate.push_back(upload(m.linear(b + ".gate_proj"), impl_->allocs, st, bytes_));
-        impl_->up.push_back(upload(m.linear(b + ".up_proj"), impl_->allocs, st, bytes_));
-        impl_->down.push_back(upload(m.linear(b + ".down_proj"), impl_->allocs, st, bytes_));
+        state->gate.push_back(upload(m.linear(b + ".gate_proj"), state->allocs, st, bytes_));
+        state->up.push_back(upload(m.linear(b + ".up_proj"), state->allocs, st, bytes_));
+        state->down.push_back(upload(m.linear(b + ".down_proj"), state->allocs, st, bytes_));
     }
+    state->workspace->reserve(n_experts, state->gate[0].ki * 16, state->gate[0].nj * 16,
+                              state->down[0].nj * 16);
+    impl_ = pending.release();
 }
 
-Exl3ExpertStore::~Exl3ExpertStore() {
-    if (impl_) {
-        for (void* p : impl_->allocs) (void) cudaFree(p);
-        delete impl_;
-    }
-}
+Exl3ExpertStore::~Exl3ExpertStore() { delete impl_; }
 
 void Exl3ExpertStore::run(const uint16_t* x, const int* ids, const float* weights, int k, uint16_t* out,
                           void* stream) const {
+    if (k == 0) return;
+    int device = -1;
+    if (k < 0 || k > n_experts_ || !x || !ids || !weights || !out ||
+        cudaGetDevice(&device) != cudaSuccess || device != impl_->device)
+        throw std::invalid_argument("exl3: expert store arguments/device mismatch");
     std::vector<Exl3Mat> g(k), u(k), d(k);
     for (int i = 0; i < k; ++i) {
         int e = ids[i];
+        if (e < 0 || e >= n_experts_) throw std::invalid_argument("exl3: expert index out of range");
         g[i] = impl_->gate[e];
         u[i] = impl_->up[e];
         d[i] = impl_->down[e];
     }
-    exl3_moe_ffn(g.data(), u.data(), d.data(), weights, k, x, out, stream);
+    exl3_moe_ffn(g.data(), u.data(), d.data(), weights, k, x, out, stream, impl_->workspace.get());
 }
 
 
@@ -98,10 +120,43 @@ void Exl3ExpertStore::run(const uint16_t* x, const int* ids, const float* weight
 
 namespace {
 
-void upload16(uint16_t* dst, const uint16_t* src, size_t bytes, cudaStream_t st) {
-    if (dst == nullptr || bytes == 0) return;
-    (void) cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, st);
-}
+template <typename T> struct StreamBuffer {
+    T* p = nullptr;
+    size_t capacity = 0;
+    void reserve(size_t count) {
+        if (count <= capacity) return;
+        if (count > SIZE_MAX / sizeof(T)) throw std::overflow_error("exl3: stream buffer overflow");
+        T* next = nullptr;
+        if (cudaMalloc((void**) &next, count * sizeof(T)) != cudaSuccess)
+            throw std::runtime_error("exl3: stream buffer allocation failed");
+        (void) cudaFree(p); p = next; capacity = count;
+    }
+    ~StreamBuffer() { if (p) (void) cudaFree(p); }
+};
+
+struct MultiBuffers {
+    StreamBuffer<float> input, output;
+    StreamBuffer<uint16_t> x, rows;
+    StreamBuffer<int> input_rows, destinations;
+    float* host_output = nullptr;
+    size_t host_capacity = 0;
+    void reserve(int tokens, int routes, int n, bool host_input = true) {
+        if (host_input) input.reserve((size_t) tokens * n);
+        x.reserve((size_t) tokens * n);
+        output.reserve((size_t) routes * n); rows.reserve((size_t) routes * n);
+        input_rows.reserve((size_t) routes);
+        destinations.reserve((size_t) routes);
+        const size_t count = (size_t) routes * n;
+        if (count > host_capacity) {
+            float* next = nullptr;
+            if (cudaMallocHost((void**) &next, count * sizeof(float)) != cudaSuccess)
+                throw std::runtime_error("exl3: pinned route output allocation failed");
+            if (host_output) (void) cudaFreeHost(host_output);
+            host_output = next; host_capacity = count;
+        }
+    }
+    ~MultiBuffers() { if (host_output) (void) cudaFreeHost(host_output); }
+};
 
 __global__ void f16_to_f32_rows_kernel(const uint16_t* __restrict__ h, float* __restrict__ y, long n) {
     long i = (long) blockIdx.x * blockDim.x + threadIdx.x;
@@ -113,16 +168,29 @@ __global__ void f32_to_f16_rows_kernel(const float* __restrict__ x, uint16_t* __
     if (i < n) h[i] = __half_as_ushort(__float2half_rn(x[i]));
 }
 
+__global__ void scatter_route_output(const float* in, const int* destinations, float* out, int rows, int n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < (int64_t) rows * n) out[(int64_t) destinations[i / n] * n + i % n] = in[i];
+}
+
 }  // namespace
 
 struct Exl3ExpertStream::Impl {
     std::string dir;
     std::unique_ptr<Exl3Model> model;
+    int device = -1;
+    cudaStream_t compute_stream = nullptr;
+    std::unique_ptr<Exl3MoeWorkspace> workspace;
+    std::unique_ptr<MultiBuffers> multi;
+    Exl3RoutePlan route_plan;
+    std::mutex run_mu;
     int n_embd = 2560;
     int n_layers = 48;
+    int layer_lo = 0, layer_hi = 48;
     int max_k = 64;
     int cache = 0;                     // slots per layer; 0 = the per-token scratch
     uint16_t* d_x = nullptr;
+    float* d_input = nullptr;
     uint16_t* d_rows = nullptr;
     float* d_out = nullptr;
 
@@ -155,6 +223,7 @@ struct Exl3ExpertStream::Impl {
         uint32_t clock = 0;
     };
     std::vector<RamLayer> ram_layers;
+    std::vector<uint8_t> ram_pinned;
     std::mutex ram_mu;
     long long ram_hits = 0, ram_misses = 0;
     int cur_layer = 0;                            // the layer `run` is on (the queue is host-side, single-threaded)
@@ -162,6 +231,8 @@ struct Exl3ExpertStream::Impl {
     // STRATA_EXL3_TIME=1: per-token upload/ffn/d2h milliseconds and the cache hit rate
     long long hits = 0, misses = 0;
     double up_ms = 0, ffn_ms = 0, d2h_ms = 0, call_ms = 0;
+    uint64_t upload_bytes = 0;
+    cudaEvent_t profile[4] = {nullptr, nullptr, nullptr, nullptr};
 
     // ---- the miss reads
     //
@@ -194,6 +265,7 @@ struct Exl3ExpertStream::Impl {
     int* d_miss_rows = nullptr;
     std::atomic<size_t> job_at{0};
     std::atomic<uint64_t> work_done{0};
+    std::atomic<int> stage_error{0};
     std::mutex work_mu;
     std::condition_variable work_cv;
     uint64_t work_gen = 0;             // guarded by work_mu
@@ -201,6 +273,11 @@ struct Exl3ExpertStream::Impl {
     int n_workers = 0;
     cudaStream_t work_stream = nullptr;   // the staging copies' own stream (see the ctor)
     cudaEvent_t stage_done = nullptr;     // recorded on it, waited on the FFN's stream
+
+    bool staged(cudaError_t e) {
+        if (e != cudaSuccess) stage_error.store((int) e, std::memory_order_relaxed);
+        return e == cudaSuccess;
+    }
 
     void stage_one(const Job& j, Stage& stg) {
         if (j.bytes == 0) return;
@@ -211,18 +288,18 @@ struct Exl3ExpertStream::Impl {
             // double buffer and the events exist to avoid.
             const int b = stg.turn;
             stg.turn ^= 1;
-            if (stg.done[b] != nullptr) (void) cudaEventSynchronize(stg.done[b]);
+            if (stg.done[b] != nullptr && !staged(cudaEventSynchronize(stg.done[b]))) return;
             std::memcpy(stg.buf[b], j.ram_src, j.bytes);
             const std::lock_guard<std::mutex> lk(api_mu);
-            (void) cudaMemcpyAsync(j.dst, stg.buf[b], j.bytes, cudaMemcpyHostToDevice, work_stream);
-            if (stg.done[b] != nullptr) (void) cudaEventRecord(stg.done[b], work_stream);
+            staged(cudaMemcpyAsync(j.dst, stg.buf[b], j.bytes, cudaMemcpyHostToDevice, work_stream));
+            if (stg.done[b] != nullptr) staged(cudaEventRecord(stg.done[b], work_stream));
             return;
         }
 #if !defined(_WIN32)
         if (j.fd >= 0 && stg.buf[0] != nullptr) {
             const int b = stg.turn;
             stg.turn ^= 1;
-            if (stg.done[b] != nullptr) (void) cudaEventSynchronize(stg.done[b]);
+            if (stg.done[b] != nullptr && !staged(cudaEventSynchronize(stg.done[b]))) return;
             const ssize_t got = ::pread(j.fd, stg.buf[b], j.bytes, (off_t) j.off);
             if (got == (ssize_t) j.bytes) {
                 src = (const uint16_t*) stg.buf[b];
@@ -241,8 +318,8 @@ struct Exl3ExpertStream::Impl {
                     // different tokens with 4 workers and identical ones with 1.  The copies are asynchronous,
                     // so serialising only the call costs nothing.
                     const std::lock_guard<std::mutex> lk(api_mu);
-                    (void) cudaMemcpyAsync(j.dst, src, j.bytes, cudaMemcpyHostToDevice, work_stream);
-                    if (stg.done[b] != nullptr) (void) cudaEventRecord(stg.done[b], work_stream);
+                    staged(cudaMemcpyAsync(j.dst, src, j.bytes, cudaMemcpyHostToDevice, work_stream));
+                    if (stg.done[b] != nullptr) staged(cudaEventRecord(stg.done[b], work_stream));
                 }
                 return;
             }
@@ -250,8 +327,9 @@ struct Exl3ExpertStream::Impl {
         }
 #endif
         {
+            if (j.ram_dst) std::memcpy(j.ram_dst, src, j.bytes);
             const std::lock_guard<std::mutex> lk(api_mu);
-            (void) cudaMemcpyAsync(j.dst, src, j.bytes, cudaMemcpyHostToDevice, work_stream);
+            staged(cudaMemcpyAsync(j.dst, src, j.bytes, cudaMemcpyHostToDevice, work_stream));
         }
     }
 
@@ -263,7 +341,27 @@ struct Exl3ExpertStream::Impl {
                               std::to_string(expert) + ".";
         const uint8_t* ram_src = nullptr;
         uint8_t* ram_dst = nullptr;
-        if (ram_slots > 0) {
+        const Slot* slots[] = {gs, us, ds};
+        const Exl3Linear* linears[] = {&Lg, &Lu, &Ld};
+        std::array<size_t, 9> sizes{};
+        bool ram_layout = true;
+        size_t plane_at = 0;
+        for (int i = 0; i < 3; ++i) {
+            const auto& L = *linears[i];
+            sizes[(size_t) i * 3] = (size_t) L.ki * L.nj * 32 * L.bits;
+            sizes[(size_t) i * 3 + 1] = (size_t) L.in() * 2;
+            sizes[(size_t) i * 3 + 2] = (size_t) L.out() * 2;
+            if (sizes[(size_t) i * 3] > slots[i]->trb || sizes[(size_t) i * 3 + 1] > slots[i]->suhb ||
+                sizes[(size_t) i * 3 + 2] > slots[i]->svhb)
+                throw std::runtime_error("exl3: expert exceeds allocated weight slot");
+            for (int p = 0; p < 3; ++p) {
+                const size_t piece = (size_t) i * 3 + p;
+                if (ram_off[(size_t) cur_layer][piece] != plane_at) ram_layout = false;
+                plane_at += sizes[piece];
+            }
+        }
+        ram_layout = ram_layout && plane_at == ram_slot_bytes[(size_t) cur_layer];
+        if (ram_slots > 0 && ram_layout) {
             const std::lock_guard<std::mutex> lk(ram_mu);
             RamLayer& rl = ram_layers[(size_t) cur_layer];
             const size_t base = ram_base[(size_t) cur_layer];
@@ -279,14 +377,17 @@ struct Exl3ExpertStream::Impl {
                 if (rl.filled < ram_slots) {
                     s = rl.filled++;
                 } else {
-                    s = (int) (std::min_element(rl.tick.begin(), rl.tick.end()) - rl.tick.begin());
-                    rl.at.erase(rl.key[(size_t) s]);
+                    for (int i = 0; i < ram_slots; ++i)
+                        if (!ram_pinned[(size_t) i] && (s < 0 || rl.tick[(size_t) i] < rl.tick[(size_t) s])) s = i;
+                    if (s >= 0) rl.at.erase(rl.key[(size_t) s]);
                 }
-                rl.at[expert] = s;
-                rl.key[(size_t) s] = expert;
-                ram_dst = ram.data() + base + (size_t) s * slot_bytes;
+                if (s >= 0) {
+                    rl.at[expert] = s;
+                    rl.key[(size_t) s] = expert;
+                    ram_dst = ram.data() + base + (size_t) s * slot_bytes;
+                }
             }
-            rl.tick[(size_t) s] = ++rl.clock;
+            if (s >= 0) { rl.tick[(size_t) s] = ++rl.clock; ram_pinned[(size_t) s] = 1; }
             static std::atomic<int> dbg{0};
             const int dn = dbg.fetch_add(1);
             if (std::getenv("STRATA_EXL3_RAM_DEBUG") != nullptr && dn % 500 == 0)
@@ -309,15 +410,31 @@ struct Exl3ExpertStream::Impl {
             ++piece;
         };
         const std::string bg = b + "gate_proj", bu = b + "up_proj", bd = b + "down_proj";
-        push(gs->tr, bg, ".trellis", Lg.trellis, gs->trb);
-        push(gs->suh, bg, ".suh", Lg.suh, gs->suhb);
-        push(gs->svh, bg, ".svh", Lg.svh, gs->svhb);
-        push(us->tr, bu, ".trellis", Lu.trellis, us->trb);
-        push(us->suh, bu, ".suh", Lu.suh, us->suhb);
-        push(us->svh, bu, ".svh", Lu.svh, us->svhb);
-        push(ds->tr, bd, ".trellis", Ld.trellis, ds->trb);
-        push(ds->suh, bd, ".suh", Ld.suh, ds->suhb);
-        push(ds->svh, bd, ".svh", Ld.svh, ds->svhb);
+        push(gs->tr, bg, ".trellis", Lg.trellis, sizes[0]);
+        push(gs->suh, bg, ".suh", Lg.suh, sizes[1]);
+        push(gs->svh, bg, ".svh", Lg.svh, sizes[2]);
+        push(us->tr, bu, ".trellis", Lu.trellis, sizes[3]);
+        push(us->suh, bu, ".suh", Lu.suh, sizes[4]);
+        push(us->svh, bu, ".svh", Lu.svh, sizes[5]);
+        push(ds->tr, bd, ".trellis", Ld.trellis, sizes[6]);
+        push(ds->suh, bd, ".suh", Ld.suh, sizes[7]);
+        push(ds->svh, bd, ".svh", Ld.svh, sizes[8]);
+    }
+
+    void prepare_expert(Blocks& blocks, int slot, int expert) {
+        const std::string base = "model.language_model.layers." + std::to_string(cur_layer) + ".mlp.experts." +
+                                  std::to_string(expert) + ".";
+        const auto g = model->linear(base + "gate_proj");
+        const auto u = model->linear(base + "up_proj");
+        const auto d = model->linear(base + "down_proj");
+        if (g.in() != n_embd || u.in() != n_embd || g.out() != u.out() ||
+            d.in() != g.out() || d.out() != n_embd)
+            throw std::runtime_error("exl3: incompatible expert FFN dimensions");
+        queue_expert(expert, &blocks.g[(size_t) slot], &blocks.u[(size_t) slot], &blocks.d[(size_t) slot], g, u, d);
+        auto set = [](Exl3Mat& m, const Exl3Linear& L) {
+            m.ki = L.ki; m.nj = L.nj; m.bits = L.bits; m.cb = L.cb;
+        };
+        set(blocks.gm[(size_t) slot], g); set(blocks.um[(size_t) slot], u); set(blocks.dm[(size_t) slot], d);
     }
 
     int fd_of(const std::string& path) {
@@ -335,10 +452,10 @@ struct Exl3ExpertStream::Impl {
 
     void stage_parallel() {
         if (jobs.empty()) return;
+        stage_error.store(0, std::memory_order_relaxed);
         if (workers.empty()) {
             for (const Job& j : jobs) stage_one(j, stage[0]);
-            return;
-        }
+        } else {
         job_at.store(0, std::memory_order_relaxed);
         work_done.store(0, std::memory_order_relaxed);
         {
@@ -347,9 +464,19 @@ struct Exl3ExpertStream::Impl {
         }
         work_cv.notify_all();
         while (work_done.load(std::memory_order_acquire) < (uint64_t) n_workers) STRATA_EXL3_PAUSE();
+        }
+        const int error = stage_error.load(std::memory_order_relaxed);
+        if (error != 0) throw std::runtime_error(std::string("exl3: expert staging failed: ") +
+                                                cudaGetErrorString((cudaError_t) error));
     }
 
     void worker_loop(int wid) {
+        strata::aux_cpus::pin_current_thread();
+        // CUDA's current device is thread-local; a stage on GPU1 cannot use a worker's default GPU0.
+        if (cudaSetDevice(device) != cudaSuccess) {
+            std::fprintf(stderr, "exl3: staging worker cannot select device %d\n", device);
+            std::abort();
+        }
         uint64_t seen = 0;
         for (;;) {
             {
@@ -368,6 +495,8 @@ struct Exl3ExpertStream::Impl {
     }
 
     ~Impl() {
+        int previous = -1;
+        (void) cudaGetDevice(&previous); (void) cudaSetDevice(device);
         {
             const std::lock_guard<std::mutex> lk(work_mu);
             work_quit = true;
@@ -381,24 +510,44 @@ struct Exl3ExpertStream::Impl {
 #if !defined(_WIN32)
         for (auto& kv : fds) if (kv.second >= 0) (void) ::close(kv.second);
 #endif
-        for (void* p : { (void*) d_x, (void*) d_rows, (void*) d_out, (void*) d_hit, (void*) d_miss,
+        for (void* p : { (void*) d_x, (void*) d_input, (void*) d_rows, (void*) d_out, (void*) d_hit, (void*) d_miss,
                          (void*) d_hit_rows, (void*) d_miss_rows }) (void) cudaFree(p);
         if (stage_done != nullptr) (void) cudaEventDestroy(stage_done);
+        for (auto e : profile) if (e) (void) cudaEventDestroy(e);
         if (work_stream != nullptr) (void) cudaStreamDestroy(work_stream);
         for (auto& v : { &scratch.g, &scratch.u, &scratch.d })
             for (Slot& s : *v) { (void) cudaFree(s.tr); (void) cudaFree(s.suh); (void) cudaFree(s.svh); }
         for (Layer& l : layers)
             for (void* p : l.allocs) (void) cudaFree(p);
+        workspace.reset();
+        multi.reset();
+        if (compute_stream) (void) cudaStreamDestroy(compute_stream);
+        if (previous >= 0) (void) cudaSetDevice(previous);
     }
 };
 
 Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int n_layers, int slots_per_layer,
-                                   void* stream, size_t ram_cache_bytes) {
-    impl_ = new Impl;
+                                   void* stream, size_t ram_cache_bytes, size_t reserve_device_bytes,
+                                   int layer_lo, int layer_hi, int prefill_tokens) {
+    if (layer_hi < 0) layer_hi = n_layers;
+    if (n_embd <= 0 || n_layers <= 0 || n_layers > 48 || slots_per_layer < -1 || slots_per_layer > 512 ||
+        layer_lo < 0 || layer_lo >= layer_hi || layer_hi > n_layers)
+        throw std::invalid_argument("exl3: invalid expert stream geometry");
+    auto pending = std::make_unique<Impl>();
+    impl_ = pending.get();
+    if (cudaGetDevice(&impl_->device) != cudaSuccess ||
+        cudaStreamCreateWithFlags(&impl_->compute_stream, cudaStreamNonBlocking) != cudaSuccess)
+        throw std::runtime_error("exl3: cannot create expert execution context");
+    impl_->workspace = std::make_unique<Exl3MoeWorkspace>();
+    impl_->multi = std::make_unique<MultiBuffers>();
+    if (const char* timing = std::getenv("STRATA_EXL3_TIME"); timing && timing[0] && timing[0] != '0')
+        for (auto& event : impl_->profile)
+            if (cudaEventCreate(&event) != cudaSuccess) throw std::runtime_error("exl3: profiling event creation failed");
     impl_->dir = model_dir;
     impl_->model = std::make_unique<Exl3Model>(model_dir);
     impl_->n_embd = n_embd;
     impl_->n_layers = n_layers;
+    impl_->layer_lo = layer_lo; impl_->layer_hi = layer_hi;
     // **THE STAGING COPIES GET THEIR OWN STREAM.**  They used to share the caller's, which put them behind
     // the resident experts' FFN: the double-buffered workers then blocked on their own DMA events for the
     // length of that FFN (measured: the staging went from 24 to 37 ms/token).  With a stream of their own
@@ -412,11 +561,13 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
     // The staging workers: enough to saturate the host's memory bandwidth on the miss reads, not more.
     const char* nw = std::getenv("STRATA_EXL3_WORKERS");
     impl_->n_workers = nw != nullptr ? std::atoi(nw) : 4;
+    if (impl_->n_workers < 0 || impl_->n_workers > 32)
+        throw std::invalid_argument("exl3: STRATA_EXL3_WORKERS must be in [0,32]");
     // the largest piece any layer's expert has (the bitrate can differ per layer), and one expert's nine
     // pieces per layer for the host cache's slot layout
     impl_->ram_slot_bytes.assign((size_t) n_layers, 0);
     impl_->ram_off.assign((size_t) n_layers, {});
-    for (int l = 0; l < n_layers; ++l) {
+    for (int l = layer_lo; l < layer_hi; ++l) {
         const std::string b = "model.language_model.layers." + std::to_string(l) + ".mlp.experts.0.";
         size_t off = 0;
         int piece = 0;
@@ -438,7 +589,7 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
         if (impl_->ram_slots > 0) {
             impl_->ram_base.assign((size_t) n_layers, 0);
             size_t at = 0;
-            for (int l = 0; l < n_layers; ++l) {
+            for (int l = layer_lo; l < layer_hi; ++l) {
                 impl_->ram_base[(size_t) l] = at;
                 at += (size_t) impl_->ram_slots * impl_->ram_slot_bytes[(size_t) l];
             }
@@ -453,11 +604,21 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
         }
     }
     impl_->stage.resize((size_t) (impl_->n_workers > 0 ? impl_->n_workers : 1));
-    for (Impl::Stage& stg : impl_->stage)
+    for (Impl::Stage& stg : impl_->stage) {
         for (int b = 0; b < 2; ++b) {
             if (cudaMallocHost((void**) &stg.buf[b], impl_->stage_bytes) != cudaSuccess) stg.buf[b] = nullptr;
             else if (cudaEventCreateWithFlags(&stg.done[b], cudaEventDisableTiming) != cudaSuccess) stg.done[b] = nullptr;
         }
+        if (!stg.buf[0] || !stg.buf[1] || !stg.done[0] || !stg.done[1]) {
+            // Without an event the DMA may still read a buffer when its next pread overwrites it.
+            // Fall back as one pair, rather than running half of a double-buffered stage.
+            for (int b = 0; b < 2; ++b) {
+                if (stg.buf[b]) (void) cudaFreeHost(stg.buf[b]);
+                if (stg.done[b]) (void) cudaEventDestroy(stg.done[b]);
+                stg.buf[b] = nullptr; stg.done[b] = nullptr;
+            }
+        }
+    }
     if (impl_->n_workers > 0) {
         impl_->workers.reserve((size_t) impl_->n_workers);
         for (int i = 0; i < impl_->n_workers; ++i) impl_->workers.emplace_back([im = impl_, i] { im->worker_loop(i); });
@@ -465,6 +626,8 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
     const int mk = impl_->max_k;
     auto alloc = [](uint16_t** p, size_t bytes) { if (cudaMalloc((void**) p, bytes ? bytes : 1) != cudaSuccess) std::abort(); };
     alloc(&impl_->d_x, (size_t) n_embd * 2);
+    if (cudaMalloc((void**) &impl_->d_input, (size_t) n_embd * sizeof(float)) != cudaSuccess)
+        throw std::runtime_error("exl3: input allocation failed");
     alloc(&impl_->d_rows, (size_t) mk * n_embd * 2);
     if (cudaMalloc((void**) &impl_->d_out, (size_t) mk * n_embd * 4) != cudaSuccess) std::abort();
     if (cudaMalloc((void**) &impl_->d_hit, (size_t) mk * n_embd * 2) != cudaSuccess ||
@@ -472,11 +635,17 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
         cudaMalloc((void**) &impl_->d_hit_rows, (size_t) mk * sizeof(int)) != cudaSuccess ||
         cudaMalloc((void**) &impl_->d_miss_rows, (size_t) mk * sizeof(int)) != cudaSuccess) std::abort();
     // size the per-slot weight buffers from expert 0 of layer 0 (all experts in a layer share a shape)
-    const std::string b0 = "model.language_model.layers.0.mlp.experts.0.";
+    const std::string b0 = "model.language_model.layers." + std::to_string(layer_lo) + ".mlp.experts.0.";
     auto setup_scratch = [&](std::vector<Impl::Slot>& slots, std::vector<Exl3Mat>& mats, const char* proj) {
         Exl3Linear L = impl_->model->linear(b0 + proj);
-        const size_t trb = (size_t) L.ki * L.nj * (256 * L.bits / 16) * 2;
-        const size_t suhb = (size_t) L.in() * 2, svhb = (size_t) L.out() * 2;
+        size_t trb = 0, suhb = 0, svhb = 0;
+        for (int l = layer_lo; l < layer_hi; ++l) {
+            const auto S = impl_->model->linear("model.language_model.layers." + std::to_string(l) +
+                                                ".mlp.experts.0." + proj);
+            trb = std::max(trb, (size_t) S.ki * S.nj * 32 * S.bits);
+            suhb = std::max(suhb, (size_t) S.in() * 2);
+            svhb = std::max(svhb, (size_t) S.out() * 2);
+        }
         slots.resize((size_t) mk); mats.resize((size_t) mk);
         for (int i = 0; i < mk; ++i) {
             alloc(&slots[(size_t) i].tr, trb);
@@ -492,6 +661,19 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
     setup_scratch(impl_->scratch.g, impl_->scratch.gm, "gate_proj");
     setup_scratch(impl_->scratch.u, impl_->scratch.um, "up_proj");
     setup_scratch(impl_->scratch.d, impl_->scratch.dm, "down_proj");
+    // Verify graphs wait for this pool. Allocating on that callback would synchronise the device
+    // behind the waiting graph, so reserve the whole 8-token, max-k window before any launch.
+    int max_ff = 0;
+    for (int l = layer_lo; l < layer_hi; ++l)
+        max_ff = std::max(max_ff, impl_->model->linear("model.language_model.layers." + std::to_string(l) +
+                                                      ".mlp.experts.0.gate_proj").out());
+    impl_->workspace->reserve(8 * mk, n_embd, max_ff, n_embd, true);
+    impl_->multi->reserve(8, 8 * mk, n_embd);
+    if (prefill_tokens > 0) {
+        // Price EXL3 prompt scratch before auto-sizing the cache; device inputs need no FP32 copy.
+        impl_->multi->reserve(std::max(8, prefill_tokens), 4096, n_embd, false);
+        impl_->workspace->reserve(4096, n_embd, max_ff, n_embd);
+    }
     (void) stream;
 
     // ---- the resident cache.  `-1` sizes it from the free VRAM: one slot in every layer costs
@@ -501,7 +683,7 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
     int slots = slots_per_layer;
     if (slots < 0) {
         size_t per_slot = 0;
-        for (int l = 0; l < n_layers; ++l) {
+        for (int l = layer_lo; l < layer_hi; ++l) {
             const std::string b = "model.language_model.layers." + std::to_string(l) + ".mlp.experts.0.";
             for (const char* p : {"gate_proj", "up_proj", "down_proj"}) {
                 Exl3Linear L = impl_->model->linear(b + p);
@@ -510,15 +692,15 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
         }
         size_t free_b = 0, total_b = 0;
         (void) cudaMemGetInfo(&free_b, &total_b);
-        const size_t reserve = (size_t) 512 << 20;   // the session's buffers and the capture
-        slots = (per_slot > 0 && free_b > reserve) ? (int) std::min<size_t>((free_b - reserve) / per_slot, 4096) : 0;
+        const size_t reserve = reserve_device_bytes;
+        slots = (per_slot > 0 && free_b > reserve) ? (int) std::min<size_t>((free_b - reserve) / per_slot, 512) : 0;
         std::fprintf(stderr, "strata generate: EXL3 expert cache auto: %.2f GiB free -> %d slots/layer\n",
                      (double) free_b / 1073741824.0, slots);
     }
     impl_->cache = slots > 0 ? slots : 0;
     if (impl_->cache > 0) {
         impl_->layers.resize((size_t) n_layers);
-        for (int l = 0; l < n_layers; ++l) {
+        for (int l = layer_lo; l < layer_hi; ++l) {
             Impl::Layer& L = impl_->layers[(size_t) l];
             L.tick.assign((size_t) impl_->cache, 0);
             const std::string b = "model.language_model.layers." + std::to_string(l) + ".mlp.experts.0.";
@@ -549,6 +731,7 @@ Exl3ExpertStream::Exl3ExpertStream(const std::string& model_dir, int n_embd, int
             }
         }
     }
+    (void) pending.release();
 }
 
 Exl3ExpertStream::~Exl3ExpertStream() { delete impl_; }
@@ -569,16 +752,33 @@ size_t Exl3ExpertStream::bytes() const {
 }
 
 bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k, float* out, void* stream) {
-    if (k <= 0) return true;
-    if (k > impl_->max_k) return false;
+    if (k == 0) return true;
+    if (k < 0 || k > impl_->max_k || layer < impl_->layer_lo || layer >= impl_->layer_hi ||
+        x_f32 == nullptr || ids == nullptr || out == nullptr) return false;
+    for (int i = 0; i < k; ++i) if (ids[i] < 0 || ids[i] >= 512) return false;
+    for (int i = 0; i < k; ++i)
+        for (int j = 0; j < i; ++j)
+            if (ids[i] == ids[j]) return run_multi(layer, x_f32, ids, 1, k, out, stream);
+    const std::lock_guard<std::mutex> run_lock(impl_->run_mu);
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(impl_->device) != cudaSuccess) return false;
+    struct RestoreDevice {
+        int previous;
+        ~RestoreDevice() { (void) cudaSetDevice(previous); }
+    } restore{previous};
+    try {
+    if (stream == nullptr) stream = (void*) impl_->compute_stream;
     cudaStream_t st = (cudaStream_t) stream;
     const long n = impl_->n_embd;
     static const bool timing = std::getenv("STRATA_EXL3_TIME") != nullptr;
     const auto t_call0 = std::chrono::steady_clock::now();
     const auto t_up0 = std::chrono::steady_clock::now();
-    f32_to_f16_rows_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(x_f32, impl_->d_x, n);
+    if (cudaMemcpyAsync(impl_->d_input, x_f32, (size_t) n * sizeof(float), cudaMemcpyHostToDevice, st) != cudaSuccess)
+        return false;
+    f32_to_f16_rows_kernel<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(impl_->d_input, impl_->d_x, n);
 
     impl_->jobs.clear();
+    impl_->ram_pinned.assign((size_t) impl_->ram_slots, 0);
     // ---- which slots this token's k experts live in.  A cache hit costs nothing; a miss reads the
     // expert out of the mmap and uploads it into the least recently used slot of this layer.
     std::vector<Exl3Mat> gm, um, dm;                 // the no-split path (no cache): one list of k
@@ -587,7 +787,6 @@ bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k,
     Impl::Layer* cache = (impl_->cache > 0 && layer >= 0 && layer < (int) impl_->layers.size() &&
                           k <= impl_->cache) ? &impl_->layers[(size_t) layer] : nullptr;
     impl_->cur_layer = layer;
-    const std::string pfx = "model.language_model.layers." + std::to_string(layer) + ".mlp.experts.";
     if (cache != nullptr) {
         hg.reserve((size_t) k); hu.reserve((size_t) k); hd.reserve((size_t) k);
         mg.reserve((size_t) k); mu.reserve((size_t) k); md.reserve((size_t) k);
@@ -609,11 +808,7 @@ bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k,
                     for (auto victim = cache->at.begin(); victim != cache->at.end(); ++victim)
                         if (victim->second == s) { cache->at.erase(victim); break; }
                 }
-                Exl3Linear Lg = impl_->model->linear(pfx + std::to_string(e) + ".gate_proj");
-                Exl3Linear Lu = impl_->model->linear(pfx + std::to_string(e) + ".up_proj");
-                Exl3Linear Ld = impl_->model->linear(pfx + std::to_string(e) + ".down_proj");
-                impl_->queue_expert(e, &cache->g[(size_t) s], &cache->u[(size_t) s], &cache->d[(size_t) s],
-                                    Lg, Lu, Ld);
+                impl_->prepare_expert(*cache, s, e);
                 cache->at[e] = s;
             }
             cache->tick[(size_t) s] = ++cache->clock;
@@ -628,25 +823,21 @@ bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k,
     } else {
         gm.resize((size_t) k); um.resize((size_t) k); dm.resize((size_t) k);
         for (int i = 0; i < k; ++i) {
-            Exl3Linear Lg = impl_->model->linear(pfx + std::to_string(ids[i]) + ".gate_proj");
-            Exl3Linear Lu = impl_->model->linear(pfx + std::to_string(ids[i]) + ".up_proj");
-            Exl3Linear Ld = impl_->model->linear(pfx + std::to_string(ids[i]) + ".down_proj");
-            impl_->queue_expert(ids[i], &impl_->scratch.g[(size_t) i], &impl_->scratch.u[(size_t) i],
-                                &impl_->scratch.d[(size_t) i], Lg, Lu, Ld);
+            impl_->prepare_expert(impl_->scratch, i, ids[i]);
             gm[(size_t) i] = impl_->scratch.gm[(size_t) i];
             um[(size_t) i] = impl_->scratch.um[(size_t) i];
             dm[(size_t) i] = impl_->scratch.dm[(size_t) i];
         }
         // no cache: nothing is resident, so the whole FFN follows the staging (the split has nothing to run early)
         impl_->stage_parallel();
-        exl3_moe_rows(gm.data(), um.data(), dm.data(), ids, k, impl_->d_x, impl_->d_rows, stream);
+        exl3_moe_rows(gm.data(), um.data(), dm.data(), ids, k, impl_->d_x, impl_->d_rows, stream, impl_->workspace.get());
     }
     // **THE RESIDENT HALF'S FFN RUNS WHILE THE MISSES ARE READ.**  Their weights are already in VRAM, so
     // nothing has to wait for the host: the kernel is enqueued before the workers start, and the miss FFN
     // follows the staging copies on the same stream.  Without the split the whole FFN waited for the last
     // miss, which is most of the doorbell.
     if (!hrow.empty())
-        exl3_moe_rows_part(hg.data(), hu.data(), hd.data(), (int) hrow.size(), impl_->d_x, impl_->d_hit, stream);
+        exl3_moe_rows_part(hg.data(), hu.data(), hd.data(), (int) hrow.size(), impl_->d_x, impl_->d_hit, stream, impl_->workspace.get());
     impl_->stage_parallel();
     const auto t_up1 = std::chrono::steady_clock::now();
     // the miss FFN (and the scatter) read what the staging wrote: order them after it
@@ -657,7 +848,7 @@ bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k,
     if (!mrow.empty()) {
         (void) cudaMemcpyAsync(impl_->d_hit_rows, hrow.data(), hrow.size() * sizeof(int), cudaMemcpyHostToDevice, st);
         (void) cudaMemcpyAsync(impl_->d_miss_rows, mrow.data(), mrow.size() * sizeof(int), cudaMemcpyHostToDevice, st);
-        exl3_moe_rows_part(mg.data(), mu.data(), md.data(), (int) mrow.size(), impl_->d_x, impl_->d_miss, stream);
+        exl3_moe_rows_part(mg.data(), mu.data(), md.data(), (int) mrow.size(), impl_->d_x, impl_->d_miss, stream, impl_->workspace.get());
         exl3_rows_scatter(impl_->d_hit, impl_->d_hit_rows, (int) hrow.size(), impl_->d_miss, impl_->d_miss_rows,
                           (int) mrow.size(), (int) n, impl_->d_rows, stream);
     } else if (!hrow.empty()) {
@@ -689,7 +880,188 @@ bool Exl3ExpertStream::run(int layer, const float* x_f32, const int* ids, int k,
             impl_->up_ms = impl_->ffn_ms = impl_->d2h_ms = impl_->call_ms = 0;
         }
     }
-    return true;
+    return se == cudaSuccess;
+    } catch (const std::exception& error) {
+        (void) cudaStreamSynchronize(stream ? (cudaStream_t) stream : impl_->compute_stream);
+        (void) cudaStreamSynchronize(impl_->work_stream);
+        for (auto& layer_cache : impl_->layers) { layer_cache.at.clear(); layer_cache.filled = 0; }
+        for (auto& layer_cache : impl_->ram_layers) { layer_cache.at.clear(); layer_cache.filled = 0; }
+        std::fprintf(stderr, "exl3 stream(layer=%d): %s\n", layer, error.what());
+        return false;
+    }
+}
+
+bool Exl3ExpertStream::run_multi(int layer, const float* x_f32, const int32_t* ids, int tokens, int k,
+                                float* out, void* stream) {
+    return run_multi_impl(layer, x_f32, ids, tokens, k, out, stream, false);
+}
+
+bool Exl3ExpertStream::run_device(int layer, const float* x_f32, const int32_t* ids, int tokens, int k,
+                                 float* out, void* stream) {
+    return run_multi_impl(layer, x_f32, ids, tokens, k, out, stream, true);
+}
+
+bool Exl3ExpertStream::run_multi_impl(int layer, const float* x_f32, const int32_t* ids, int tokens, int k,
+                                     float* out, void* stream, bool device_io) {
+    if (tokens == 0) return true;
+    if (tokens < 0 || k <= 0 || k > impl_->max_k || layer < impl_->layer_lo || layer >= impl_->layer_hi ||
+        !x_f32 || !ids || !out || tokens > INT32_MAX / k) return false;
+    const std::lock_guard<std::mutex> lock(impl_->run_mu);
+    int previous = -1;
+    if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(impl_->device) != cudaSuccess) return false;
+    struct RestoreDevice {
+        int previous;
+        ~RestoreDevice() { (void) cudaSetDevice(previous); }
+    } restore{previous};
+    const auto st = stream ? (cudaStream_t) stream : impl_->compute_stream;
+    const bool timing = impl_->profile[0] != nullptr;
+    const auto call_started = std::chrono::steady_clock::now();
+    try {
+        auto& plan = impl_->route_plan;
+        plan.build(ids, tokens, k, 512);
+        constexpr int tile_limit = 4096;
+        const int tile = std::min(tokens * k, tile_limit);
+        const int n = impl_->n_embd;
+        auto& batch = *impl_->multi;
+        batch.reserve(tokens, tile, n, !device_io);
+        if (!device_io && cudaMemcpyAsync(batch.input.p, x_f32, (size_t) tokens * n * sizeof(float),
+                                          cudaMemcpyHostToDevice, st) != cudaSuccess)
+            throw std::runtime_error("exl3: multi input upload failed");
+        const long input_elements = (long) tokens * n;
+        f32_to_f16_rows_kernel<<<(unsigned) ((input_elements + 255) / 256), 256, 0, st>>>(
+            device_io ? x_f32 : batch.input.p, batch.x.p, input_elements);
+        impl_->cur_layer = layer;
+        auto* cache = impl_->cache > 0 ? &impl_->layers[(size_t) layer] : nullptr;
+        if (cache && !cache->at.empty()) {
+            std::vector<uint8_t> resident(plan.experts.size());
+            for (size_t g = 0; g < plan.experts.size(); ++g)
+                resident[g] = cache->at.count(plan.experts[g]) != 0;
+            plan.prioritize_resident(resident);
+        }
+        const int wave_size = cache ? impl_->cache : impl_->max_k;
+        std::vector<Exl3Mat> gates, ups, downs, route_g, route_u, route_d;
+        std::vector<int> input_rows;
+        input_rows.reserve((size_t) tile);
+        route_g.reserve((size_t) tile); route_u.reserve((size_t) tile); route_d.reserve((size_t) tile);
+        for (size_t first = 0; first < plan.experts.size(); first += (size_t) wave_size) {
+            const size_t end = std::min(first + (size_t) wave_size, plan.experts.size());
+            gates.clear(); ups.clear(); downs.clear(); impl_->jobs.clear();
+            impl_->ram_pinned.assign((size_t) impl_->ram_slots, 0);
+            // Slots referenced by this wave cannot be evicted until its final tile has completed.
+            std::vector<uint8_t> pinned(cache ? (size_t) impl_->cache : 0, 0);
+            for (size_t group = first; group < end; ++group) {
+                const int expert = plan.experts[group];
+                int slot = (int) (group - first);
+                Impl::Blocks* blocks = &impl_->scratch;
+                if (cache) {
+                    blocks = cache;
+                    const auto hit = cache->at.find(expert);
+                    if (hit != cache->at.end()) { slot = hit->second; ++impl_->hits; }
+                    else {
+                        ++impl_->misses;
+                        if (cache->filled < impl_->cache) slot = cache->filled++;
+                        else {
+                            slot = -1;
+                            for (int s = 0; s < impl_->cache; ++s)
+                                if (!pinned[(size_t) s] && (slot < 0 || cache->tick[(size_t) s] < cache->tick[(size_t) slot]))
+                                    slot = s;
+                            if (slot < 0) throw std::runtime_error("exl3: all expert slots pinned");
+                            for (auto it = cache->at.begin(); it != cache->at.end(); ++it)
+                                if (it->second == slot) { cache->at.erase(it); break; }
+                        }
+                        impl_->prepare_expert(*cache, slot, expert);
+                        cache->at[expert] = slot;
+                    }
+                    pinned[(size_t) slot] = 1;
+                    cache->tick[(size_t) slot] = ++cache->clock;
+                } else {
+                    ++impl_->misses;
+                    impl_->prepare_expert(impl_->scratch, slot, expert);
+                }
+                gates.push_back(blocks->gm[(size_t) slot]); ups.push_back(blocks->um[(size_t) slot]);
+                downs.push_back(blocks->dm[(size_t) slot]);
+            }
+            if (timing) {
+                for (const auto& job : impl_->jobs) impl_->upload_bytes += job.bytes;
+                (void) cudaEventRecord(impl_->profile[0], impl_->work_stream);
+            }
+            impl_->stage_parallel();
+            if (timing) (void) cudaEventRecord(impl_->profile[1], impl_->work_stream);
+            if (cudaEventRecord(impl_->stage_done, impl_->work_stream) != cudaSuccess ||
+                cudaStreamWaitEvent(st, impl_->stage_done, 0) != cudaSuccess)
+                throw std::runtime_error("exl3: expert upload event failed");
+            const int route_end = plan.offsets[end];
+            size_t group = first;
+            for (int route = plan.offsets[first]; route < route_end;) {
+                while (route >= plan.offsets[group + 1]) ++group;
+                const int count = std::min(tile, (device_io ? plan.offsets[group + 1] : route_end) - route);
+                input_rows.clear(); route_g.clear(); route_u.clear(); route_d.clear();
+                for (int r = route; r < route + count; ++r) {
+                    while (r >= plan.offsets[group + 1]) ++group;
+                    const size_t local = group - first;
+                    input_rows.push_back(plan.destinations[(size_t) r] / k);
+                    route_g.push_back(gates[local]); route_u.push_back(ups[local]); route_d.push_back(downs[local]);
+                }
+                if (cudaMemcpyAsync(batch.input_rows.p, input_rows.data(), (size_t) count * sizeof(int),
+                                    cudaMemcpyHostToDevice, st) != cudaSuccess)
+                    throw std::runtime_error("exl3: route upload failed");
+                const long elements = (long) count * n;
+                if (timing) (void) cudaEventRecord(impl_->profile[2], st);
+                if (device_io && count >= 16) {
+                    exl3_moe_group_gemm(route_g[0], route_u[0], route_d[0], count, batch.x.p,
+                                         batch.input_rows.p, batch.output.p, (void*) st, *impl_->workspace);
+                } else {
+                    exl3_moe_rows_indexed(route_g.data(), route_u.data(), route_d.data(), count, batch.x.p,
+                                          batch.input_rows.p, batch.rows.p, (void*) st, *impl_->workspace);
+                    f16_to_f32_rows_kernel<<<(unsigned) ((elements + 255) / 256), 256, 0, st>>>(batch.rows.p, batch.output.p, elements);
+                }
+                if (timing) (void) cudaEventRecord(impl_->profile[3], st);
+                if (device_io) {
+                    if (cudaMemcpyAsync(batch.destinations.p, plan.destinations.data() + route, (size_t) count * sizeof(int),
+                                        cudaMemcpyHostToDevice, st) != cudaSuccess)
+                        throw std::runtime_error("exl3: destination upload failed");
+                    scatter_route_output<<<(unsigned) ((elements + 255) / 256), 256, 0, st>>>(
+                        batch.output.p, batch.destinations.p, out, count, n);
+                    if (cudaStreamSynchronize(st) != cudaSuccess) throw std::runtime_error("exl3: device FFN failed");
+                } else {
+                if (cudaMemcpyAsync(batch.host_output, batch.output.p, (size_t) elements * sizeof(float),
+                                    cudaMemcpyDeviceToHost, st) != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess)
+                    throw std::runtime_error("exl3: multi FFN execution failed");
+                for (int r = 0; r < count; ++r)
+                    std::memcpy(out + (size_t) plan.destinations[(size_t) route + r] * n,
+                                batch.host_output + (size_t) r * n, (size_t) n * sizeof(float));
+                }
+                if (timing) {
+                    float ms = 0;
+                    if (cudaEventElapsedTime(&ms, impl_->profile[2], impl_->profile[3]) == cudaSuccess) impl_->ffn_ms += ms;
+                }
+                route += count;
+            }
+            if (timing) {
+                float ms = 0;
+                if (cudaEventElapsedTime(&ms, impl_->profile[0], impl_->profile[1]) == cudaSuccess) impl_->up_ms += ms;
+            }
+        }
+        if (timing) {
+            impl_->call_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - call_started).count();
+            if (layer + 1 == impl_->layer_hi) {
+                std::fprintf(stderr, "exl3 CUDA%d [%d,%d) rows=%d: pool %.2f ms, upload %.2f ms (%.2f MiB), FFN %.2f ms, cache %lld/%lld\n",
+                    impl_->device, impl_->layer_lo, impl_->layer_hi, tokens, impl_->call_ms, impl_->up_ms,
+                    (double) impl_->upload_bytes / (1 << 20), impl_->ffn_ms, impl_->hits, impl_->hits + impl_->misses);
+                impl_->call_ms = impl_->up_ms = impl_->ffn_ms = 0;
+                impl_->hits = impl_->misses = 0; impl_->upload_bytes = 0;
+            }
+        }
+        return true;
+    } catch (const std::exception& e) {
+        // A failed window is not reusable: uploads may have replaced only part of a cache slot.
+        (void) cudaStreamSynchronize(st);
+        (void) cudaStreamSynchronize(impl_->work_stream);
+        for (auto& cache : impl_->layers) { cache.at.clear(); cache.filled = 0; }
+        for (auto& cache : impl_->ram_layers) { cache.at.clear(); cache.filled = 0; }
+        std::fprintf(stderr, "exl3 multi(layer=%d): %s\n", layer, e.what());
+        return false;
+    }
 }
 
 }  // namespace strata::kernels

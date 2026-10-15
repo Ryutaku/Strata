@@ -396,6 +396,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  target_link_libraries(strata_kernels PRIVATE ${_strata_gpu_blas_target})
   # ngram.cpp decodes EXL3 n-gram rows with the shared CPU codebook/row decoder (strata_kernels_cpu).
   target_link_libraries(strata_kernels PRIVATE strata_kernels_cpu)
   # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
@@ -1293,6 +1294,9 @@ endif()
 # tools/exl3 (codebook.py, reconstruct.py).  CPU-only, no model, no GPU.  The fixture is generated from
 # the specification, so a mismatch is always the port's fault.
 if(STRATA_BUILD_TESTS)
+  add_executable(exl3_route_plan_test src/kernels/exl3_route_plan_test.cpp)
+  target_include_directories(exl3_route_plan_test PRIVATE include)
+  add_test(NAME exl3_route_plan_test COMMAND exl3_route_plan_test)
   add_executable(exl3_parity src/kernels/exl3_parity.cpp)
   target_include_directories(exl3_parity PRIVATE include)
   target_link_libraries(exl3_parity PRIVATE strata_kernels_cpu)
@@ -1314,6 +1318,13 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME exl3_loader_validation
              COMMAND ${CMAKE_COMMAND} -E env ${_exl3_validation_env}
                      ${_exl3_python} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_exl3_loader.py)
+    execute_process(COMMAND ${_exl3_python} -c "import regex" OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE _tokenizer_probe)
+    if(_tokenizer_probe EQUAL 0)
+      add_test(NAME exl3_tokenizer_validation
+               COMMAND ${_exl3_python} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_exl3_tokenizer.py)
+    else()
+      message(STATUS "STRATA tests: install tools/exl3/requirements.txt for tokenizer validation")
+    endif()
     # One fixture per integer bitrate: every released EXL3 branch uses integer K only
     # (2.05: K=2/4, 3.05: 3/5, 4.05: 4/6, 5.05: 5/6/7, 6.05: 6/8).
     foreach(_k RANGE 1 8)
@@ -1339,6 +1350,14 @@ if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_HIP OR STRATA_ENABLE_CUDA))
   target_include_directories(exl3_gemv_parity PRIVATE ${_strata_gpu_include_directories} include)
   target_link_libraries(exl3_gemv_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   add_test(NAME exl3_gemv_parity COMMAND exl3_gemv_parity)
+  add_executable(exl3_moe_multi_parity src/kernels/exl3_moe_multi_parity.cpp)
+  target_include_directories(exl3_moe_multi_parity PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(exl3_moe_multi_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  add_test(NAME exl3_moe_multi_parity COMMAND exl3_moe_multi_parity)
+  set_tests_properties(exl3_moe_multi_parity PROPERTIES SKIP_RETURN_CODE 77)
+  add_executable(exl3_moe_window_bench src/kernels/exl3_moe_window_bench.cpp)
+  target_include_directories(exl3_moe_window_bench PRIVATE ${_strata_gpu_include_directories} include)
+  target_link_libraries(exl3_moe_window_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   # PleTable::open_exl3 (the EXL3 n-gram table) against the numpy codec.
   add_executable(ple_exl3_parity src/kernels/ple_exl3_parity.cpp)
   target_include_directories(ple_exl3_parity PRIVATE ${_strata_gpu_include_directories} include)

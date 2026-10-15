@@ -1,4 +1,6 @@
 #include "strata/core/native_head.hpp"
+#include "strata/core/weights.hpp"
+#include "strata/core/on_device.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -17,11 +19,31 @@ NativeHead::~NativeHead() {
 }
 
 void NativeHead::unload() {
-    if (weights_) strata::kernels::native_q6_k_unpack(weights_);
+    const OnDevice on(device_);
+    if (weights_ && owns_weights_) strata::kernels::native_q6_k_unpack(weights_);
     if (scratch_) cudaFree(scratch_);
-    if (weights_) cudaFree(weights_);
+    if (weights_ && owns_weights_) cudaFree(weights_);
     scratch_ = nullptr;
     weights_ = nullptr;
+    bytes_ = 0; n_in_ = n_out_ = 0; type_ = device_ = -1; owns_weights_ = true;
+}
+
+bool NativeHead::bind(const WeightRef& w, std::string& err) {
+    if (loaded() || !w.native_data || !strata::kernels::native_mmvq_supported(w.native_type) ||
+        w.ne0 <= 0 || w.ne0 > INT_MAX || w.ne0 % 256 || w.ne1 <= 0 || w.ne1 > INT_MAX) {
+        err = "native head: cannot bind the loaded output projection";
+        return false;
+    }
+    if (cudaGetDevice(&device_) != cudaSuccess ||
+        cudaMalloc(&scratch_, strata::kernels::native_q8_1_bytes((int) w.ne0, 1)) != cudaSuccess) {
+        err = "native head: activation scratch allocation failed";
+        return false;
+    }
+    weights_ = const_cast<void*>(w.native_data);
+    type_ = w.native_type; n_in_ = (int) w.ne0; n_out_ = (int) w.ne1;
+    bytes_ = strata::kernels::native_mmvq_weight_bytes(type_, n_in_, n_out_);
+    owns_weights_ = false;
+    return true;
 }
 
 bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {

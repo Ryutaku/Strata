@@ -1048,6 +1048,11 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
 struct Exl3Drive {
     strata::kernels::Exl3ExpertStream* stream = nullptr;
     int cur_layer = 0;
+    bool* failed = nullptr;
+    std::vector<strata::kernels::Exl3ExpertStream*> layers;
+    strata::kernels::Exl3ExpertStream* for_layer(int layer) const {
+        return layers.empty() ? stream : (layer >= 0 && (size_t) layer < layers.size() ? layers[(size_t) layer] : nullptr);
+    }
 };
 void drive_exl3_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
                      int64_t k, float* out) {
@@ -1056,8 +1061,25 @@ void drive_exl3_pool(void* user, const float* x_f, const int32_t* ids, const flo
     { const cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) std::fprintf(stderr, "strata generate: prior cuda error before the EXL3 pool: %s\n", cudaGetErrorString(e)); }
     if (t->stream == nullptr) { std::memset(out, 0, (size_t) n_embd * (size_t) k * sizeof(float)); return; }
     const int layer = t->cur_layer++;
-    if (!t->stream->run(layer, x_f, ids, (int) k, out, nullptr))
+    if (!t->stream->run(layer, x_f, ids, (int) k, out, nullptr)) {
+        if (t->failed) *t->failed = true;
+        std::memset(out, 0, (size_t) n_embd * (size_t) k * sizeof(float));
         std::fprintf(stderr, "strata generate: EXL3 expert stream failed at layer %d\n", layer);
+    }
+}
+
+void drive_exl3_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t tokens,
+                           int64_t k, float* out, int64_t layer) {
+    auto* drive = (Exl3Drive*) user;
+    auto* experts = drive->for_layer((int) layer);
+    if (!experts || tokens <= 0 || tokens > INT32_MAX || k <= 0 || k > 64 ||
+        !experts->run_multi((int) layer, x_f, ids, (int) tokens, (int) k, out, nullptr)) {
+        if (drive->failed) *drive->failed = true;
+        // Let the verifier drain its wait kernels; the caller rejects this window via the failure latch.
+        if (drive->stream && tokens > 0 && k > 0)
+            std::memset(out, 0, (size_t) tokens * (size_t) k * 2560 * sizeof(float));
+        std::fprintf(stderr, "strata generate: EXL3 window failed at layer %lld\n", (long long) layer);
+    }
 }
 
 /// Plan v0.3 P6: the pool for a verify window.
@@ -1117,6 +1139,7 @@ struct GpuStage {
     int64_t lb = 0, le = 0;
     double pcie_frac = 0.0;
     double link_gbps = 0.0;   ///< this card's probed host->device bandwidth (PcieAuto's per-stage share)
+    std::unique_ptr<strata::core::Exl3Pack> exl3_pack;
     strata::core::WeightTable wt;
     strata::core::NativeDense dense;
     strata::core::NativeHead head;
@@ -1125,6 +1148,7 @@ struct GpuStage {
     strata::core::ExpertCache cache;
     std::vector<std::pair<int32_t, int32_t>> profile;   ///< its layers' share of the profile, hottest first
     int32_t* d_res = nullptr;                            ///< the residency table on its device
+    std::unique_ptr<strata::kernels::Exl3ExpertStream> exl3_stream;
     strata::core::Verifier ver;
     strata::core::Verifier ver_b;                        ///< --pipeline-windows: the odd windows' verifier
     strata::prefill::Prefill sp;
@@ -2343,19 +2367,34 @@ int main(int argc, char** argv) {
         } else (void) cudaGetLastError();
     }
 #endif
-    // EXL3 has a single-token expert callback, not the GGUF verifier/batched/stage callbacks.
-    // Reject incompatible modes before model allocation instead of failing late or using the wrong pool.
-    if (!o.exl3_dir.empty() && (o.spec != 0 || o.batch != 0 || !o.layer_split.empty() ||
+    if (!o.exl3_dir.empty() && (o.layer_split == "auto" ||
                                !o.native_preset.empty() || !o.native_head_gguf.empty() ||
                                !o.native_dense_gguf.empty())) {
-        std::fprintf(stderr, "strata generate: --exl3 supports single-GPU token decode; "
-                             "--spec, --batch, --layer-split and GGUF native weights are unsupported\n");
+        std::fprintf(stderr, "strata generate: --exl3 does not yet accept --layer-split auto or GGUF native weights; use explicit layer boundaries\n");
         return 2;
+    }
+    if (!o.exl3_dir.empty() && (o.spec > 0 || o.batch > 0 || o.prefill_chunk > 0 || o.prefill_auto || !o.layer_split.empty())) {
+        if (const char* dense = std::getenv("STRATA_EXL3_DENSE"); dense &&
+            (std::strcmp(dense, "exl3") == 0 || std::strncmp(dense, "only:", 5) == 0)) {
+            std::fprintf(stderr, "strata generate: EXL3 windows and prefill need the default native dense projections; unset STRATA_EXL3_DENSE\n");
+            return 2;
+        }
+        // The window uses the same native BF16/GDN/QSA arithmetic as its single-token reference.
+        o.gr_native_mmvf = true;
+        o.native_bf16 = o.native_bf16_extra = true;
+        o.native_moe_combine = o.native_gdn = o.native_router = true;
+        o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
+        if (o.aux_cpus.empty() && std::getenv("STRATA_AUX_CPUS") == nullptr) o.aux_cpus = "auto";
     }
     // --expert-cache has different units for EXL3 (per layer). Keep its request for the EXL3 stream,
     // but disable the GGUF cache and hit callback: that callback requires a Drive*, not Exl3Drive*.
     const int exl3_cache_slots = o.expert_cache_given ? o.expert_cache : -1;
-    if (!o.exl3_dir.empty()) o.expert_cache = 0;
+    if (!o.exl3_dir.empty()) {
+        o.expert_cache = 0;
+        // EXL3's per-layer LRU owns replacement. The GGUF adaptive tier requires its blob/residency
+        // tables and must never be armed by the batch path's otherwise unconditional usage counters.
+        o.adapt_every = 0; o.adapt_swaps = 0; o.adapt_async = 0;
+    }
     strata::core::set_coupled_draft(o.coupled_draft);
     {   // --host-core / STRATA_HOST_CORE, before the pool and the session pin any thread
         std::string hc = o.host_core;
@@ -2493,7 +2532,7 @@ int main(int argc, char** argv) {
     // split, the visible GPUs no stage runs on, in order
     int remote_dev[3] = {1, 2, 3};
     if (multi_gpu) {
-        if (o.expert_profile.empty()) {
+        if (o.exl3_dir.empty() && o.expert_profile.empty()) {
             std::fprintf(stderr, "strata generate: a layer split across GPUs needs --expert-profile\n");
             return 2;
         }
@@ -2587,7 +2626,14 @@ int main(int argc, char** argv) {
         }
     }
 #endif
-    if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty())) {
+    if (o.prefill_auto && !o.exl3_dir.empty()) {
+        // EXL3 budgets owned prompt buffers before filling its expert LRU; there is no GGUF
+        // profile/cache loan to size. Keep the requested ceiling instead of falling back to 2K.
+        o.prefill_auto = false;
+        o.prefill_chunk = std::min(o.prefill_chunk, o.max_context);
+        std::fprintf(stderr, "strata generate: EXL3 prefill auto: owned buffers for %lld tokens (no GGUF cache loan)\n",
+                     (long long) o.prefill_chunk);
+    } else if (o.prefill_auto && (o.no_prefill_borrow || o.expert_profile.empty())) {
         o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
         o.prefill_chunk = 2048;
     }
@@ -3227,7 +3273,9 @@ int main(int argc, char** argv) {
     std::unique_ptr<strata::core::Exl3Pack> exl3_pack;
     if (!o.exl3_dir.empty()) {
         exl3_pack = std::make_unique<strata::core::Exl3Pack>(o.exl3_dir);
-        if (!exl3_pack->build(wt, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+        if (!exl3_pack->build(wt, err, nullptr, 0, multi_gpu ? (int) split_at[0] : 48)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1;
+        }
         std::fprintf(stderr, "strata generate: EXL3 %s: %zu roles, %.1f MiB EXL3 linears, %.1f MiB staged, in %.1f s\n",
                      o.exl3_dir.c_str(), wt.all().size(), (double) exl3_pack->exl3_bytes() / (1 << 20),
                      (double) exl3_pack->arena_bytes() / (1 << 20), load_s());
@@ -3625,6 +3673,13 @@ int main(int argc, char** argv) {
     std::vector<std::unique_ptr<GpuStage>> stages;
     // One stage's dense weights on its device (the caller has made it current): `trim` = only layers [lb, le).
     auto load_stage_weights = [&](GpuStage& st, int64_t lb, int64_t le, bool trim) -> bool {
+        if (!o.exl3_dir.empty()) {
+            st.exl3_pack = std::make_unique<strata::core::Exl3Pack>(o.exl3_dir);
+            if (!st.exl3_pack->build(st.wt, err, nullptr, (int) lb, (int) le)) {
+                std::fprintf(stderr, "strata generate: EXL3 CUDA%d: %s\n", st.dev, err.c_str()); return false;
+            }
+            return true;
+        }
         std::set<std::string> skip_s = skip_base;
         uint64_t pool_s = pool_bytes;
         if (trim) {
@@ -3672,8 +3727,8 @@ int main(int argc, char** argv) {
         // Later stages' weights load here (0.1.39), except `--layer-split auto` with the trim asked: those load after
         // the split search (see late_weights), so `auto` can trim them too.
         if (!late_weights) {
-            const int64_t lb = stage_trim ? split_at[i] : 0;
-            const int64_t le = stage_trim ? (i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers) : 0;
+            const int64_t lb = stage_trim || !o.exl3_dir.empty() ? split_at[i] : 0;
+            const int64_t le = stage_trim || !o.exl3_dir.empty() ? (i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers) : 0;
             if (!load_stage_weights(st, lb, le, stage_trim)) return 1;
         }
         // THE SESSION AND THE HEAD WAIT FOR THE SPLIT SEARCH.  `session_bytes` prices a stage's session by its
@@ -4528,6 +4583,9 @@ int main(int argc, char** argv) {
         }
         const bool last = i + 1 == stages.size();
         const strata::core::WeightRef* wo_s = st.wt.find("output.weight");
+        if (last && !o.exl3_dir.empty() && wo_s && !st.head.bind(*wo_s, err)) {
+            std::fprintf(stderr, "strata generate: EXL3 CUDA%d head: %s\n", st.dev, err.c_str()); return 1;
+        }
         if (wo_s == nullptr ||
             (last && !o.native_head_gguf.empty() && !st.head.load(o.native_head_shards, g.n_embd, wo_s->ne1, err))) {
             std::fprintf(stderr, "strata generate: layer split, CUDA%d head: %s%s\n", st.dev,
@@ -4742,6 +4800,10 @@ int main(int argc, char** argv) {
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
+    if (!o.exl3_dir.empty() && (o.spec >= 2 || o.batch > 0 || o.serve) && !multi_gpu && !native_head.bind(*wo, err)) {
+        std::fprintf(stderr, "strata generate: EXL3 output head: %s\n", err.c_str());
+        return 1;
+    }
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
         if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
@@ -5633,6 +5695,7 @@ int main(int argc, char** argv) {
 
     for (auto& stp : stages) {
         GpuStage& st = *stp;
+        if (!o.exl3_dir.empty()) continue; // EXL3 has per-layer trellis caches, created below.
         const auto& lay = strata::kernels::cpu::expert_layout();
         // the drafter and the head are already allocated by now (they load above, before this), so what is left
         // to hold back is the windows - and `free_b` has already lost the drafter.
@@ -5863,6 +5926,7 @@ int main(int argc, char** argv) {
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     Drive drive;
     Exl3Drive exl3_drive;
+    exl3_drive.failed = &drive.d.failed;
     std::unique_ptr<strata::kernels::Exl3ExpertStream> exl3_stream;
     if (!o.exl3_dir.empty()) {
         // The EXL3 stream keeps its own per-layer cache: `--expert-cache N` counts slots per layer there (the
@@ -5887,9 +5951,33 @@ int main(int argc, char** argv) {
             }
             exl3_ram = (size_t) std::max(0, mib) << 20;
         }
+        auto reserve_for = [&](const strata::core::SessionState& state, const strata::core::NativeHead& head) {
+            int device = 0;
+            (void) cudaGetDevice(&device);
+            const int64_t requested = device == 0 ? o.vram_reserve_mib
+                : std::max<int64_t>(o.vram_reserve_mib, o.vram_reserve_later_mib);
+            size_t reserve = (size_t) std::max<int64_t>(512, requested) << 20;
+            if (o.prefill_chunk > 0)
+                reserve += strata::prefill::Prefill::bytes_needed_owned(g, state, o.prefill_chunk, false);
+            if (!o.mtp.empty() && head.loaded() && mtp.device() == device) {
+                reserve += mtp.bind_bytes(head.row_bytes(), n_vocab);
+                for (const auto& draft : slot_mtp)
+                    reserve += draft->bind_bytes(head.row_bytes(), n_vocab);
+            }
+            return reserve;
+        };
         exl3_stream = std::make_unique<strata::kernels::Exl3ExpertStream>(o.exl3_dir, (int) g.n_embd, (int) g.n_layers,
-                                                                         exl3_slots, nullptr, exl3_ram);
+                    exl3_slots, nullptr, exl3_ram, reserve_for(ss, native_head), 0, multi_gpu ? (int) split_at[0] : (int) g.n_layers,
+                    (int) o.prefill_chunk);
         exl3_drive.stream = exl3_stream.get();
+        exl3_drive.layers.assign((size_t) g.n_layers, exl3_stream.get());
+        for (auto& stage : stages) {
+            const strata::core::OnDevice on(stage->dev);
+            stage->exl3_stream = std::make_unique<strata::kernels::Exl3ExpertStream>(o.exl3_dir, (int) g.n_embd, (int) g.n_layers,
+                exl3_slots, nullptr, exl3_ram, reserve_for(stage->ss, stage->head), (int) stage->lb, (int) stage->le,
+                (int) o.prefill_chunk);
+            for (int64_t l = stage->lb; l < stage->le; ++l) exl3_drive.layers[(size_t) l] = stage->exl3_stream.get();
+        }
         std::fprintf(stderr, "strata generate: EXL3 expert stream ready (%d slots/layer, %.2f GiB device; "
                              "%d host slots/layer, %.2f GiB RAM)\n",
                      exl3_stream->slots_per_layer(), (double) exl3_stream->bytes() / (double) (1ull << 30),
@@ -7396,7 +7484,7 @@ int main(int argc, char** argv) {
             }
         }
 #endif
-        const bool share_pool = o.batch <= 0 && !o.no_pool;
+        const bool share_pool = o.exl3_dir.empty() && o.batch <= 0 && !o.no_pool;
         bool share_has_work = strata::prefill::share_rules::default_share_has_work(
             (int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert));   // #1595
         if (!share_has_work)
@@ -7705,8 +7793,10 @@ int main(int argc, char** argv) {
         // `--prefill auto` split could stop at start with "device buffers for a chunk of 2048 tokens do not fit".  A
         // chunk that does not fit is tried again one size smaller, down to 512 tokens (a smaller chunk only reads slower).
         auto init_prompt_paths = [&]() -> int {   // 0: ready; 1: failed (err set); 2: failed with "do not fit"
+            sp.set_exl3_experts(exl3_stream.get());
             for (size_t i = 0; i < stages.size(); ++i) {
                 GpuStage& st = *stages[i];
+                st.sp.set_exl3_experts(st.exl3_stream.get());
                 st.sp.set_stage(st.lb, i + 1 < stages.size() ? st.le : -1, i + 1 < stages.size() ? &stages[i + 1]->sp : nullptr);
                 const strata::core::OnDevice on(st.dev);
                 void* sb = nullptr;              // this stage's own loan, out of its own cache
@@ -7882,6 +7972,7 @@ int main(int argc, char** argv) {
         }
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
+        vh.external_experts = !o.exl3_dir.empty();
         vh.d_res = thits.d_res;
         // STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, with STRATA_ROUTE_RESIDENT=<margin>; changes the output): the MTP
         // draft's router gets the same residency bias, with the last layer's residency row as its table (single GPU)
@@ -7969,6 +8060,7 @@ int main(int argc, char** argv) {
                     GpuStage& gs = *stages[(size_t) st - 1];
                     const strata::core::OnDevice on(gs.dev);
                     strata::core::VerifyHits vs;
+                    vs.external_experts = !o.exl3_dir.empty();
                     vs.d_res = gs.d_res;
                     vs.h_res = host_res.empty() ? nullptr : host_res.data();
                     vs.cache_base = gs.cache.device_slot(0);
@@ -7990,7 +8082,8 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
-            for (int st = 0; st + 1 < n_stages; ++st) stage_ver(st).set_next(&stage_ver(st + 1), &split_drive);
+            for (int st = 0; st + 1 < n_stages; ++st)
+                stage_ver(st).set_next(&stage_ver(st + 1), !o.exl3_dir.empty() ? (void*) &exl3_drive : (void*) &split_drive);
             std::string plan_s = "0-" + std::to_string(split_at[0] - 1) + " (CUDA0)";
             for (int st = 1; st < n_stages; ++st)
                 plan_s += ", " + std::to_string(split_at[(size_t) st - 1]) + "-" + std::to_string(split_drive.end[st] - 1) +
@@ -8021,6 +8114,7 @@ int main(int argc, char** argv) {
                                    last ? nullptr : hand_b[(size_t) st]);
                 const strata::core::OnDevice on(gs.dev);
                 strata::core::VerifyHits vs;
+                vs.external_experts = !o.exl3_dir.empty();
                 vs.d_res = gs.d_res;
                 vs.h_res = host_res.empty() ? nullptr : host_res.data();
                 vs.cache_base = gs.cache.device_slot(0);
@@ -8053,7 +8147,8 @@ int main(int argc, char** argv) {
                 return 1;
             }
             // the setters reach the later stages; the pipeline never chains run/commit
-            for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
+            for (int st = 0; st + 1 < n_stages; ++st)
+                stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), !o.exl3_dir.empty() ? (void*) &exl3_drive : (void*) &split_drive_b);
         }
         ver.set_remote_expert_opt(remote_opt.get());
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
@@ -8118,8 +8213,10 @@ int main(int argc, char** argv) {
             }
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
-        const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
-        void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
+        const strata::core::PoolMultiFn win_pool_fn = !o.exl3_dir.empty() ? &drive_exl3_pool_multi :
+                                                      n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
+        void* const win_pool_user = !o.exl3_dir.empty() ? (void*) &exl3_drive :
+                                    n_stages > 1 ? (void*) &split_drive : (void*) &drive;
         mem_mark("the verifier and the drafter's binding");
         ver.set_split(o.spec_split);
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
@@ -8184,7 +8281,8 @@ int main(int argc, char** argv) {
         // reaches the middle stages through stage_ver_p) - their pool routing, and the drafter's events (in a pipelined
         // prompt read, a stage-1 window waits until the drafter has read the rows of the same parity's previous window)
         strata::core::Verifier* PV[2][2] = {{&ver, &ver_b}, {pipe ? &stages.back()->ver : nullptr, pipe ? &stages.back()->ver_b : nullptr}};
-        SplitDrive* PSD[2] = {&split_drive, &split_drive_b};
+        void* PSD[2] = {!o.exl3_dir.empty() ? (void*) &exl3_drive : (void*) &split_drive,
+                        !o.exl3_dir.empty() ? (void*) &exl3_drive : (void*) &split_drive_b};
         cudaEvent_t pl_mtp_ev[2] = {nullptr, nullptr};
         bool pl_mtp_live[2] = {false, false};
         bool pl_prepared = false;
@@ -8221,7 +8319,7 @@ int main(int argc, char** argv) {
                         strata::core::Verifier& v = stage_ver_p(st, par);
                         if (!v.in_flight()) continue;
                         any = true;
-                        if (v.service(&drive_pool_split, PSD[par], e2) < 0) return;
+                        if (v.service(win_pool_fn, PSD[par], e2) < 0) return;
                         if (v.done(e2)) v.pl_finish(nullptr, e2);
                         else if (!e2.empty()) return;
                     }
@@ -8629,7 +8727,8 @@ int main(int argc, char** argv) {
             // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)
             bool batched = false;
             const strata::program::draft_kv::Plan dkv = strata::program::draft_kv::plan(
-                use_mtp, multi_gpu, split_mtp_batch && !mtp_first, strata::core::native_embed() != nullptr);
+                use_mtp, multi_gpu, split_mtp_batch && !mtp_first,
+                strata::core::native_embed() != nullptr || !o.exl3_dir.empty());
             if (dkv.try_batched || dkv.why != nullptr) {
                 strata::prefill::Prefill& dsp = multi_gpu ? stages.back()->sp : sp;   // the drafter's stage
                 const char* why = dkv.why;
@@ -8949,6 +9048,7 @@ int main(int argc, char** argv) {
         int64_t adapt_nswaps = 0;   // the blocking tier's swaps chosen, cumulative (the decode timing line's swaps/window)
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
+            if (!o.exl3_dir.empty()) return true;
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
@@ -9693,12 +9793,17 @@ int main(int argc, char** argv) {
             // showed CUDA0's cache as if it were the whole GPU's: a 4-GPU 256K run read 3327 experts when the four
             // cards held 13320, and the Monitor tab was wrong by 4x for every multi-GPU config.  The tiers are
             // disjoint by construction (remote_experts.cpp skips any pair a stage already claimed), so they add.
-            const int64_t slots_primary = (int64_t) xcache.slots();
-            const int64_t mib_primary = (int64_t) (xcache.bytes() >> 20);
+            const int64_t slots_primary = exl3_stream
+                ? (int64_t) exl3_stream->slots_per_layer() * (multi_gpu ? split_at[0] : g.n_layers)
+                : (int64_t) xcache.slots();
+            const int64_t mib_primary = exl3_stream ? (int64_t) (exl3_stream->bytes() >> 20)
+                                                   : (int64_t) (xcache.bytes() >> 20);
             int64_t slots_all = slots_primary, mib_all = mib_primary;
             for (const auto& st : stages) {
-                slots_all += (int64_t) st->cache.slots();
-                mib_all += (int64_t) (st->cache.bytes() >> 20);
+                slots_all += st->exl3_stream ? (int64_t) st->exl3_stream->slots_per_layer() * (st->le - st->lb)
+                                            : (int64_t) st->cache.slots();
+                mib_all += st->exl3_stream ? (int64_t) (st->exl3_stream->bytes() >> 20)
+                                          : (int64_t) (st->cache.bytes() >> 20);
             }
             for (int r = 0; r < 3; ++r)
                 if (o.expert_cache_remote[(size_t) r] > 0) {
@@ -13322,7 +13427,8 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
-        if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
+        if (!multi_gpu && !o.no_pool && o.exl3_dir.empty()) prefill.set_cpu_pool(&pool);
+        prefill.set_exl3_experts(exl3_stream.get());
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
                           borrow_bytes)) {
@@ -13648,7 +13754,7 @@ int main(int argc, char** argv) {
         // --spec-follow: the run ends with the continuation
         const int64_t max_new = follow.empty() ? o.max_new : std::min<int64_t>(o.max_new, (int64_t) follow.size());
         int64_t follow_differ = 0, follow_emitted = 0;
-        if (thits.d_res == nullptr) {
+        if (o.exl3_dir.empty() && thits.d_res == nullptr) {
             std::fprintf(stderr, "strata generate: --spec needs the device residency table (--expert-profile, "
                                  "--expert-cache and the token graph)\n");
             return 2;
@@ -13656,6 +13762,7 @@ int main(int argc, char** argv) {
         mem_mark("the head and the prompt path");
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
+        vh.external_experts = !o.exl3_dir.empty();
         vh.d_res = thits.d_res;
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;
@@ -13931,7 +14038,8 @@ int main(int argc, char** argv) {
             if (adapt_nowait()) apply_pending(false);
                 else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
-            if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
+            if (!ver.run(T, window.data(), p, !o.exl3_dir.empty() ? &drive_exl3_pool_multi : &drive_pool_multi,
+                          !o.exl3_dir.empty() ? (void*) &exl3_drive : (void*) &drive, outv.data(), err) || drive.d.failed) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
