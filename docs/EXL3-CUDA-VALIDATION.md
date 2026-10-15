@@ -125,6 +125,8 @@ Target: `thelastspark/Swift-Qwen3.8-Flash-Next-exl3` 6.05 bpw with PLE; INT8 KV.
 - Two 32-token batch-MTP outputs match their solo references exactly with layer split enabled.
   A separate 64-token lifecycle test checks cancellation, the unaffected slot, resuming the
   cancelled slot, the other slot's next turn and reuse of the cancelled slot. All checks pass.
+  Single-GPU batching and a two-group, two-GPU pipeline also match both 32-token solo references
+  with no MTP runtime loaded.
 - Two independently submitted 261632-token prompts both retrieve distinct FIRST/MIDDLE/LAST
   markers. Each has 262144 context capacity and its own INT8 KV state. The first prompt reads
   while the second waits for admission; its decode overlaps the second prompt's chunked read.
@@ -136,6 +138,9 @@ Target: `thelastspark/Swift-Qwen3.8-Flash-Next-exl3` 6.05 bpw with PLE; INT8 KV.
   their combined request wall time is 282.2 s. These short 40-token retrieval answers do not
   establish sustained decode throughput. Their run overlapped a CPU build and is a functional
   stress result, not a controlled speed comparison.
+- The final candidate repeats both 261632-token marker checks successfully with 16384 chunks,
+  fixed K split 1 and two slots. Prefill is 1986 / 1185 tok/s and combined wall time is 359.4 s.
+  This smaller-chunk configuration is slower for full input reads on this machine.
 - A 128K prompt followed by all 512 requested tokens with 16384 chunks, K split 1 and 12
   upload workers measures 2051 prefill / 30.9 decode tok/s. More upload workers do not establish
   a general speed improvement; the runtime default remains 4.
