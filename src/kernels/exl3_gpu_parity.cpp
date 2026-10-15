@@ -83,6 +83,8 @@ int main() {
     fails += run(40, 160, 3, 2, 2);      // the real expert down_proj shape
     fails += run(16, 24, 4, 1, 3);       // mcg
     fails += run(16, 16, 2, 0, 4);       // 3inst
+    // LM heads have >65535 output columns. The Hadamard row pass must not put n in grid.y.
+    fails += run(8, 4104, 2, 2, 5);     // 128 x 65664, just beyond CUDA's grid.y limit
     // Every released EXL3 branch uses integer K only; cover every integer bitrate.
     for (int K = 1; K <= 8; ++K) fails += run(8, 8, K, 2, 100 + K);
     std::printf("%s\n", fails ? "FAIL" : "OK");

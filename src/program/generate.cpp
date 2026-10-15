@@ -711,6 +711,8 @@ void usage() {
                  "strata generate --pack DIR --tokens \"1,2,3\" [options]\n"
                  "\n"
                  "  --pack DIR           the pack directory (default pack/full)\n"
+                 "  --exl3 DIR           Experimental EXL3 safetensors model (integer K=1..8)\n"
+                 "  --ple-exl3 FILE      EXL3 n-gram embedding table; alternative to --ple-gguf\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
                  "  --gpu LIST           run on these GPUs, comma-separated nvidia-smi/PCI indices (default: every\n"
@@ -2341,6 +2343,19 @@ int main(int argc, char** argv) {
         } else (void) cudaGetLastError();
     }
 #endif
+    // EXL3 has a single-token expert callback, not the GGUF verifier/batched/stage callbacks.
+    // Reject incompatible modes before model allocation instead of failing late or using the wrong pool.
+    if (!o.exl3_dir.empty() && (o.spec != 0 || o.batch != 0 || !o.layer_split.empty() ||
+                               !o.native_preset.empty() || !o.native_head_gguf.empty() ||
+                               !o.native_dense_gguf.empty())) {
+        std::fprintf(stderr, "strata generate: --exl3 supports single-GPU token decode; "
+                             "--spec, --batch, --layer-split and GGUF native weights are unsupported\n");
+        return 2;
+    }
+    // --expert-cache has different units for EXL3 (per layer). Keep its request for the EXL3 stream,
+    // but disable the GGUF cache and hit callback: that callback requires a Drive*, not Exl3Drive*.
+    const int exl3_cache_slots = o.expert_cache_given ? o.expert_cache : -1;
+    if (!o.exl3_dir.empty()) o.expert_cache = 0;
     strata::core::set_coupled_draft(o.coupled_draft);
     {   // --host-core / STRATA_HOST_CORE, before the pool and the session pin any thread
         std::string hc = o.host_core;
@@ -2684,8 +2699,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --logits-stride > 1 requires --max-new 1 and --dump-logits\n");
         return 2;
     }
-    if (o.no_ple && !o.ple_gguf.empty()) {
-        std::fprintf(stderr, "strata generate: --no-ple and --ple-gguf are mutually exclusive\n");
+    if ((!o.ple_gguf.empty() && !o.ple_exl3.empty()) ||
+        (o.no_ple && (!o.ple_gguf.empty() || !o.ple_exl3.empty()))) {
+        std::fprintf(stderr, "strata generate: choose one of --ple-gguf, --ple-exl3 and --no-ple\n");
         return 2;
     }
     if (o.native_ple_postops && o.no_ple) {
@@ -2693,7 +2709,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (!o.no_ple && o.ple_gguf.empty() && o.ple_exl3.empty()) {
-        std::fprintf(stderr, "strata generate: --ple-gguf is required; --no-ple explicitly enables a diagnostic ablation\n");
+        std::fprintf(stderr, "strata generate: --ple-gguf or --ple-exl3 is required; --no-ple enables a diagnostic ablation\n");
         return 2;
     }
     // P7 audit: positions, cells and pooled-block indices are cast to int32 on the device path.
@@ -5852,7 +5868,7 @@ int main(int argc, char** argv) {
         // The EXL3 stream keeps its own per-layer cache: `--expert-cache N` counts slots per layer there (the
         // GGUF count is global because its blobs are one pool), `auto`/unset sizes it from the free VRAM after
         // this instance's buffers, and 0 turns it off.
-        const int exl3_slots = o.expert_cache_given ? o.expert_cache : -1;
+        const int exl3_slots = exl3_cache_slots;
         // `--expert-ram-cache auto` (the default): a quarter of what the host reports as available, capped at
         // 4 GiB, so a machine that is already short of RAM is not made shorter.  A number sets it, 0 turns it off.
         size_t exl3_ram = 0;

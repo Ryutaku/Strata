@@ -1,8 +1,8 @@
 # EXL3 support in Strata
 
-> **Status: in progress.** The format is specified and a tested Python reference decoder exists
-> (`tools/exl3/`, `tools/test_exl3_codebook.py`). The engine does **not** load EXL3 models yet.
-> This page is the contract the C++/HIP backend must satisfy. Back to the [README](../README.md).
+> **Status: experimental.** The engine loads EXL3 models with `--exl3` and n-gram tables with
+> `--ple-exl3`. CPU and GPU parity tests cover integer K=1..8. Half-integer trellis rates are not
+> supported by the engine loader. Back to the [README](../README.md).
 
 [EXL3](https://github.com/turboderp-org/exllamav3/blob/master/doc/exl3.md) is turboderp's quantized
 format for ExLlamaV3, a variant of **QTIP**. It is **not** a GGUF variant: the weights live in
@@ -179,9 +179,9 @@ synthetic table against the numpy codec, **bit-exact**, in both Direct and Mmap 
 `ple_exl3_parity`). Per turboderp's discussion #12 the table is a swappable file, and the existing
 IQ4_NL/Q5_0/FP8 path already covers dropping in an F16/FP8 table.
 
-## Engine integration plan
+## Engine integration
 
-The engine only reads GGUF today (`src/artifact/gguf_reader.cpp`), so EXL3 support is staged:
+The EXL3 path uses safetensors alongside the existing GGUF loader:
 
 1. **Loader** — *done.* `include/strata/artifact/safetensors.hpp` (mmap reader + header parser) and
    `include/strata/artifact/exl3_model.hpp` (`Exl3Model`: resolves a linear across shards via
@@ -256,6 +256,20 @@ Each rule is checked on the real model: `strata-exl3-pack <dir> --dump <out>` wr
 22 roles, and `tools/exl3/check_engine_form.py <dir> <out>` recomputes them from the safetensors with an
 independent numpy implementation of the converter's rules — **22/22 roles match** on
 `Qwen3.8-Flash-Next-exl3` 3.05bpw, byte-exact for the trellis permutations.
+
+## Building and testing on NVIDIA
+
+The fork's [CUDA validation record](EXL3-CUDA-VALIDATION.md) describes the fixes, checks and limits.
+
+Install the optional format-test dependencies with `python -m pip install -r tools/exl3/requirements.txt`.
+Build with the normal CUDA configuration and `-DSTRATA_BUILD_TESTS=ON`, then run
+`ctest --test-dir <build> -R exl3 --output-on-failure`. The model checker also exercises malformed
+shapes, truncated tensor ranges and unsupported half-integer rates before a decode kernel runs.
+
+The EXL3 path currently uses the single-token expert callback. Use one GPU, `--spec 0` and the
+normal graph-capture path. `--batch`, `--layer-split` and GGUF native-weight overrides are rejected.
+`--no-capture --no-pool` is a diagnostic dense-only run, not a complete model inference.
+Choose exactly one PLE source (`--ple-exl3` or `--ple-gguf`); `--no-ple` is an explicit ablation.
 
 ## Running the model
 

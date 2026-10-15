@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -99,6 +100,25 @@ public:
         auto tr = tensor(base + ".trellis");
         auto suh = tensor(base + ".suh");
         auto svh = tensor(base + ".svh");
+        // Validate before narrowing dimensions or letting a decode kernel read the mapped bytes.
+        // In particular, a half-integer K must not be silently rounded down to an integer K.
+        if (tr->dtype != "I16" || tr->shape.size() != 3 ||
+            tr->shape[0] <= 0 || tr->shape[1] <= 0 ||
+            tr->shape[0] > std::numeric_limits<int>::max() / 16 ||
+            tr->shape[1] > std::numeric_limits<int>::max() / 16 ||
+            tr->shape[0] % 8 != 0 || tr->shape[1] % 8 != 0 ||
+            tr->shape[2] < 16 || tr->shape[2] > 128 || tr->shape[2] % 16 != 0) {
+            throw std::runtime_error("exl3: " + base +
+                ": need I16 trellis [in/16,out/16,16*K], H128-aligned dimensions and integer K=1..8");
+        }
+        if (suh->dtype != "F16" || svh->dtype != "F16" ||
+            suh->shape != std::vector<int64_t>{tr->shape[0] * 16} ||
+            svh->shape != std::vector<int64_t>{tr->shape[1] * 16}) {
+            throw std::runtime_error("exl3: " + base + ": need F16 suh[in] and svh[out]");
+        }
+        if (weight_map_.count(base + ".bias")) {
+            throw std::runtime_error("exl3: " + base + ": biased EXL3 linears are not supported");
+        }
         Exl3Linear L;
         L.trellis = (const uint16_t*)data(*tr);
         L.suh = (const uint16_t*)data(*suh);

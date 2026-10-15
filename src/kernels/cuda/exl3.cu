@@ -98,7 +98,8 @@ __global__ void widen_kernel(const uint16_t* __restrict__ s, float* __restrict__
 
 __global__ void had_rows_kernel(float* __restrict__ w, int k, int n) {
     (void)k;
-    int rb = blockIdx.x, c = blockIdx.y;
+    // The vocabulary/head output dimension can exceed CUDA's grid.y limit of 65535.
+    int rb = blockIdx.y, c = blockIdx.x;
     float b[HAD];
     for (int i = 0; i < HAD; ++i) b[i] = w[(long)(rb * HAD + i) * n + c];
     for (int step = 1; step < HAD; step <<= 1)
@@ -156,13 +157,27 @@ void exl3_reconstruct_weight(const uint16_t* trellis, int ki, int nj, int bits, 
         std::fprintf(stderr, "exl3_reconstruct_weight: cudaMalloc failed\n");
         std::abort();
     }
+    auto check_launch = [](const char* name) {
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "exl3_reconstruct_weight %s: %s\n", name, cudaGetErrorString(e));
+            std::abort();
+        }
+    };
     decode_kernel<<<dim3(nj, ki), 256, 0, st>>>(trellis, ki, nj, words, bits, cb, d_what, n);
+    check_launch("decode_kernel");
     widen_kernel<<<(int)((nelem + 255) / 256), 256, 0, st>>>(d_what, d_w, nelem);
-    had_rows_kernel<<<dim3(k / HAD, n), 1, 0, st>>>(d_w, k, n);
+    check_launch("widen_kernel");
+    had_rows_kernel<<<dim3(n, k / HAD), 1, 0, st>>>(d_w, k, n);
+    check_launch("had_rows_kernel");
     had_cols_kernel<<<dim3(k, n / HAD), 1, 0, st>>>(d_w, k, n);
+    check_launch("had_cols_kernel");
     scale_rows_kernel<<<dim3(k), 128, 0, st>>>(d_w, n, suh);
+    check_launch("scale_rows_kernel");
     scale_cols_kernel<<<dim3(n), 128, 0, st>>>(d_w, k, n, svh);
+    check_launch("scale_cols_kernel");
     f32_to_f16_kernel<<<(int)((nelem + 255) / 256), 256, 0, st>>>(d_w, out, nelem);
+    check_launch("f32_to_f16_kernel");
     (void)cudaFree(d_what);
     (void)cudaFree(d_w);
 }

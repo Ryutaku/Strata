@@ -1307,6 +1307,13 @@ if(STRATA_BUILD_TESTS)
     endif()
   endforeach()
   if(NOT _exl3_python STREQUAL "")
+    set(_exl3_validation_env STRATA_EXL3_MODEL_CHECK=$<TARGET_FILE:strata-exl3-model>)
+    if(TARGET strata)
+      list(APPEND _exl3_validation_env STRATA_EXL3_ENGINE=$<TARGET_FILE:strata>)
+    endif()
+    add_test(NAME exl3_loader_validation
+             COMMAND ${CMAKE_COMMAND} -E env ${_exl3_validation_env}
+                     ${_exl3_python} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_exl3_loader.py)
     # One fixture per integer bitrate: every released EXL3 branch uses integer K only
     # (2.05: K=2/4, 3.05: 3/5, 4.05: 4/6, 5.05: 5/6/7, 6.05: 6/8).
     foreach(_k RANGE 1 8)

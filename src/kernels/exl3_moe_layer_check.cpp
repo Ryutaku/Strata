@@ -6,6 +6,8 @@
 #include "strata/kernels/exl3_experts.hpp"
 #include "strata/kernels/cpu/exl3.hpp"
 
+#include <cuda_runtime.h>
+
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -37,6 +39,10 @@ int main(int argc, char** argv) {
     try {
         std::string dir = argv[1];
         int layer = std::stoi(argv[2]), n_experts = std::stoi(argv[3]), k = argc > 4 ? std::stoi(argv[4]) : 10;
+        if (layer < 0 || layer >= 48 || n_experts < 1 || n_experts > 512 || k < 1 || k > n_experts) {
+            std::fprintf(stderr, "need layer 0..47 and 1 <= k <= n_experts <= 512\n");
+            return 2;
+        }
         Exl3Model m(dir);
         Exl3ExpertStore store(dir, layer, n_experts, nullptr);
         std::printf("store: layer %d, %d experts, %.1f MiB on GPU\n", layer, store.n_experts(),
@@ -63,7 +69,6 @@ int main(int argc, char** argv) {
         if (cudaDeviceSynchronize() != cudaSuccess) { std::fprintf(stderr, "cuda sync failed: %s\n", cudaGetErrorString(cudaGetLastError())); return 1; }
         std::vector<uint16_t> out_gpu(2560);
         (void) cudaMemcpy(out_gpu.data(), d_out, (size_t) 2560 * 2, cudaMemcpyDeviceToHost);
-        (void) cudaFree(d_x); (void) cudaFree(d_out);
         std::printf("GPU run returned\n"); std::fflush(stdout);
 
         // ---- timing: expert FFN compute throughput (one layer, k experts) ----
@@ -72,12 +77,18 @@ int main(int argc, char** argv) {
             const int iters = 200;
             auto t0 = std::chrono::high_resolution_clock::now();
             for (int it = 0; it < iters; ++it) store.run(d_x, ids.data(), w.data(), k, d_out, nullptr);
-            (void) cudaDeviceSynchronize();
+            const cudaError_t timed = cudaDeviceSynchronize();
+            if (timed != cudaSuccess) {
+                std::fprintf(stderr, "timed FFN failed: %s\n", cudaGetErrorString(timed));
+                (void) cudaFree(d_x); (void) cudaFree(d_out);
+                return 1;
+            }
             auto t1 = std::chrono::high_resolution_clock::now();
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
             std::printf("expert FFN: %.3f ms/layer (k=%d experts) -> ~%.1f tok/s expert-compute-bound (x48 layers)\n",
                         ms, k, 1000.0 / (ms * 48.0));
         }
+        (void) cudaFree(d_x); (void) cudaFree(d_out);
         // CPU reference
         std::printf("running CPU...\n"); std::fflush(stdout);
         auto cpu_loop = [&](std::vector<float>& acc_out) {

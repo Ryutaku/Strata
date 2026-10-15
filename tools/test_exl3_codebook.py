@@ -77,18 +77,18 @@ class CodebookTests(unittest.TestCase):
 class BitstreamTests(unittest.TestCase):
     @staticmethod
     def _bruteforce_windows(packed_u16, bits):
-        """Independent reader: flatten to a bit list, then take 16-bit LE windows."""
+        """Read individual bits in MSB-first uint32 order, independently of the funnel shift."""
+        words = np.asarray(packed_u16, dtype="<u2").reshape(-1)
+        words32 = [int(words[i]) | (int(words[i + 1]) << 16) for i in range(0, len(words), 2)]
+        stream = [(word >> bit) & 1 for word in words32 for bit in range(31, -1, -1)]
         total = 256 * bits
-        words = np.asarray(packed_u16, dtype=np.uint16).reshape(-1)
-        bits_list = [(int(w) >> k) & 1 for w in words for k in range(16)]
-        bits_list = bits_list[:total]
         out = []
         for t in range(256):
-            start = (t * bits + bits - 16) % total
-            v = 0
-            for k in range(16):
-                v |= bits_list[(start + k) % total] << k
-            out.append(v)
+            end = (t + 1) * bits
+            value = 0
+            for pos in range(end - 16, end):
+                value = (value << 1) | stream[pos % total]
+            out.append(value)
         return np.array(out, dtype=np.uint32)
 
     def test_windows_match_bruteforce(self):
@@ -98,6 +98,12 @@ class BitstreamTests(unittest.TestCase):
             got = exl3.windows_tile(packed, bits)
             want = self._bruteforce_windows(packed, bits)
             np.testing.assert_array_equal(got, want, "bits=%d" % bits)
+
+    def test_stored_word_order(self):
+        packed = np.tile(np.array([0x4567, 0x0123], dtype=np.uint16), 8)
+        # MSB-first bits of 0x01234567, wrapping to the preceding word.
+        np.testing.assert_array_equal(exl3.windows_tile(packed, 1)[:4],
+                                      [0x8ACE, 0x159C, 0x2B38, 0x5670])
 
     def test_unpack_tile_shape_and_order(self):
         packed = np.arange(48, dtype=np.uint16)          # bits=3 -> 48 words

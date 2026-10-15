@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -131,7 +132,11 @@ private:
         if (peek() == '-') { neg = true; ++p_; }
         int64_t v = 0;
         bool any = false;
-        while (p_ < end_ && *p_ >= '0' && *p_ <= '9') { v = v * 10 + (*p_ - '0'); ++p_; any = true; }
+        while (p_ < end_ && *p_ >= '0' && *p_ <= '9') {
+            const int digit = *p_ - '0';
+            if (v > (std::numeric_limits<int64_t>::max() - digit) / 10) fail("integer overflow");
+            v = v * 10 + digit; ++p_; any = true;
+        }
         if (!any) fail("bad number");
         return neg ? -v : v;
     }
@@ -221,14 +226,41 @@ public:
         ::close(fd);
         if (base_ == MAP_FAILED) { base_ = nullptr; throw std::runtime_error("safetensors: mmap failed"); }
 #endif
-        if (size_ < 8) throw std::runtime_error("safetensors: file too small");
-        uint64_t n = 0;
-        std::memcpy(&n, base_, 8);
-        if (n == 0 || 8 + n > size_) throw std::runtime_error("safetensors: bad header length");
-        header_len_ = (size_t)n;
-        data_offset_ = 8 + header_len_;
-        const char* hp = reinterpret_cast<const char*>(base_ + 8);
-        tensors_ = safetensors_detail::HeaderParser(hp, hp + header_len_).parse();
+        try {
+            if (size_ < 8) throw std::runtime_error("safetensors: file too small");
+            uint64_t n = 0;
+            std::memcpy(&n, base_, 8);
+            if (n == 0 || n > size_ - 8) throw std::runtime_error("safetensors: bad header length");
+            header_len_ = (size_t)n;
+            data_offset_ = 8 + header_len_;
+            const char* hp = reinterpret_cast<const char*>(base_ + 8);
+            tensors_ = safetensors_detail::HeaderParser(hp, hp + header_len_).parse();
+            for (const auto& item : tensors_) {
+                const auto& t = item.second;
+                if (t.begin > t.end || t.end > size_ - data_offset_)
+                    throw std::runtime_error("safetensors: tensor range outside file: " + t.name);
+                size_t count = 1;
+                for (int64_t dim : t.shape) {
+                    if (dim < 0 || (dim != 0 && count > std::numeric_limits<size_t>::max() / (size_t) dim))
+                        throw std::runtime_error("safetensors: invalid tensor shape: " + t.name);
+                    count *= (size_t) dim;
+                }
+                // Byte widths used by this loader, including codebook markers and PLE metadata.
+                const size_t width = t.dtype == "F64" || t.dtype == "I64" || t.dtype == "U64" ? 8 :
+                    t.dtype == "F32" || t.dtype == "I32" || t.dtype == "U32" ? 4 :
+                    t.dtype == "F16" || t.dtype == "BF16" || t.dtype == "I16" || t.dtype == "U16" ? 2 :
+                    t.dtype == "I8" || t.dtype == "U8" || t.dtype == "BOOL" ||
+                    t.dtype == "F8_E4M3" || t.dtype == "F8_E5M2" ? 1 : 0;
+                if (width == 0 || count > std::numeric_limits<size_t>::max() / width || count * width != t.nbytes())
+                    throw std::runtime_error("safetensors: tensor dtype/shape/byte count mismatch: " + t.name);
+            }
+        } catch (...) {
+#if !defined(_WIN32)
+            ::munmap((void*) base_, size_);
+            base_ = nullptr;
+#endif
+            throw;
+        }
     }
 
     SafetensorsFile(const SafetensorsFile&) = delete;

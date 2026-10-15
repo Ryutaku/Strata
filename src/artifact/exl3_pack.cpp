@@ -517,11 +517,9 @@ bool stage_exl3_requantized(Exl3Pack::Impl& im, const RoleSpec& r, const ModelGe
                 return;
             }
             for (size_t i = 0; i < elems; ++i) f32[i] = f16_to_f32(h16[i]);
-            // `ggml_quantize_chunk` offsets BOTH sides itself: `src + start` and `dst + start_row*row_size`.
-            // So both pointers are shifted back by `start` and the function lands on this chunk's buffers.
-            const float* src_base = f32.data() - (size_t) r0 * (size_t) n_in;
-            uint8_t* dst_base = q.data() - (size_t) r0 * row_bytes;
-            ggml_quantize_chunk(qtype, src_base, dst_base, (int64_t) r0 * n_in, nr, n_in, nullptr);
+            // These buffers contain only this chunk. Quantize from row zero rather than forming
+            // pointers before their allocations to cancel ggml_quantize_chunk's own row offset.
+            ggml_quantize_chunk(qtype, f32.data(), q.data(), 0, nr, n_in, nullptr);
             if (std::getenv("STRATA_EXL3_Q5_CHECK") != nullptr && r0 == 0) {
                 // round trip: dequantize what we just quantized and compare with the source
                 std::vector<float> back(elems);
